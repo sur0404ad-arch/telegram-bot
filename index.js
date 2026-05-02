@@ -40,7 +40,7 @@ app.post("/", async (req, res) => {
       contentType: "audio/mpeg"
     });
 
- await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendAudio`, {
+ await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}//sendVoice`, {
   method: "POST",
   headers: formData.getHeaders(),
   body: formData

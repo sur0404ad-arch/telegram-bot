@@ -35,16 +35,16 @@ app.post("/", async (req, res) => {
 
     const formData = new FormData();
     formData.append("chat_id", String(chatId));
-    formData.append("voice", audioBuffer, {
+    formData.append("audio", audioBuffer, {
       filename: "voice.mp3",
       contentType: "audio/mpeg"
     });
 
-    await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendVoice`, {
-      method: "POST",
-      body: formData
-    });
-
+ await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendAudio`, {
+  method: "POST",
+  headers: formData.getHeaders(),
+  body: formData
+});
     res.sendStatus(200);
   } catch (error) {
     console.error(error);

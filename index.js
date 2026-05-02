@@ -12,17 +12,28 @@ app.post("/", async (req, res) => {
     const chatId = req.body.message.chat.id;
     const text = req.body.message.text;
 
-    await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: "🔊 Озвучка: " + text
-      })
-    });
-  }
+ const voiceResponse = await fetch("https://api.elevenlabs.io/v1/text-to-speech/EXAVITQu4vr4xnSDxMaL", {
+  method: "POST",
+  headers: {
+    "xi-api-key": process.env.ELEVEN_API_KEY,
+    "Content-Type": "application/json"
+  },
+  body: JSON.stringify({
+    text: text,
+    model_id: "eleven_multilingual_v2"
+  })
+});
+
+const audioBuffer = await voiceResponse.arrayBuffer();
+
+const formData = new FormData();
+formData.append("chat_id", chatId);
+formData.append("voice", Buffer.from(audioBuffer), "voice.ogg");
+
+await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendVoice`, {
+  method: "POST",
+  body: formData
+});
 
   res.sendStatus(200);
 });

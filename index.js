@@ -7,7 +7,6 @@ app.use(express.json());
 app.get("/", (req, res) => {
   res.send("Bot is running");
 });
-
 app.post("/", async (req, res) => {
   if (req.body.message) {
     const chatId = req.body.message.chat.id;
@@ -20,13 +19,14 @@ app.post("/", async (req, res) => {
       },
       body: JSON.stringify({
         chat_id: chatId,
-        text: "Ты написал: " + text
+        text: "🔊 Озвучка: " + text
       })
     });
   }
 
   res.sendStatus(200);
 });
+
  
 const PORT = process.env.PORT || 3000;
 

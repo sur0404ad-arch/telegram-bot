@@ -19,7 +19,7 @@ app.post("/", async (req, res) => {
     const chatId = message.chat.id;
     const text = message.text;
 
-    const voiceResponse = await fetch("https://api.elevenlabs.io/v1/text-to-speech/EXAVITQu4vr4xnSDxMaL", {
+    const voiceResponse = await fetch("https://api.elevenlabs.io/v1/text-to-speech/s0phbFBBp708ZeIy8oGx", {
       method: "POST",
       headers: {
         "xi-api-key": process.env.ELEVEN_API_KEY,

@@ -10,6 +10,7 @@ app.get("/", (req, res) => {
 });
 
 app.post("/", async (req, res) => {
+  console.log("UPDATE:", req.body);
   try {
     const message = req.body.message;
     if (!message || !message.text) {

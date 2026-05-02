@@ -8,13 +8,9 @@ app.get("/", (req, res) => {
 });
 
 app.post("/", async (req, res) => {
-  const message = req.body.message;
-
-  if (message) {
-    const chatId = message.chat.id;
-    const text = message.text;
-
-    console.log("Message:", text);
+  if (req.body.message) {
+    const chatId = req.body.message.chat.id;
+    const text = req.body.message.text;
 
     await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
       method: "POST",
@@ -28,6 +24,8 @@ app.post("/", async (req, res) => {
     });
   }
 
+  res.sendStatus(200);
+});
   res.sendStatus(200);
 });
 

@@ -7,11 +7,25 @@ app.get("/", (req, res) => {
   res.send("Bot is running");
 });
 
-app.post("/", (req, res) => {
-  console.log(req.body);
+app.post("/", async (req, res) => {
+  const message = req.body.message;
 
-  if (req.body.message) {
-    console.log("Message:", req.body.message.text);
+  if (message) {
+    const chatId = message.chat.id;
+    const text = message.text;
+
+    console.log("Message:", text);
+
+    await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: "Ты написал: " + text
+      })
+    });
   }
 
   res.sendStatus(200);

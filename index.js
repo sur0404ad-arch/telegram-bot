@@ -14,7 +14,6 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const PORT = process.env.PORT || 3000;
 
 const TG = `https://api.telegram.org/bot${BOT_TOKEN}`;
-const WIKI_API = "https://ru.wikisource.org/w/api.php";
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -54,7 +53,6 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
 
       const jobId = newJob(chatId);
       await saveSession(chatId, { stopped: false, job_id: jobId });
-
       return autoplay(chatId, jobId);
     }
 
@@ -75,14 +73,13 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       job_id: jobId
     });
 
-    await sendMessage(chatId, "🔎 Ищу книгу...");
+    await sendMessage(chatId, "🔎 Ищу и готовлю книгу...");
 
     const book = await getOrCreateBook(text);
-
     if (!isAlive(chatId, jobId)) return;
 
     if (!book || !book.parts.length) {
-      return sendMessage(chatId, "❌ Не удалось найти или подготовить книгу.");
+      return sendMessage(chatId, "❌ Не удалось подготовить книгу.");
     }
 
     await saveSession(chatId, {
@@ -96,7 +93,7 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
 
     await sendMessage(
       chatId,
-      `📖 Нашёл:\n${book.title}\n\n🎬 Начинаю автоплей.\nЧастей: ${book.parts.length}\n\n/stop — остановить\n/resume — продолжить`
+      `📖 Нашёл:\n${book.title}\n\n🎬 Запускаю как аудиосериал.\nЧастей: ${book.parts.length}\n\n/stop — остановить\n/resume — продолжить`
     );
 
     return autoplay(chatId, jobId);
@@ -130,16 +127,26 @@ async function initDB() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS audio_cache (
+      book_key TEXT NOT NULL,
+      part_index INT NOT NULL,
+      audio BYTEA NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (book_key, part_index)
+    );
+  `);
 }
 
 function newJob(chatId) {
-  const jobId = String(Date.now()) + "_" + Math.random().toString(16).slice(2);
+  const jobId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
   jobs[chatId] = jobId;
   return jobId;
 }
 
 function stopJob(chatId) {
-  jobs[chatId] = "stopped_" + Date.now();
+  jobs[chatId] = `stopped_${Date.now()}`;
 
   if (controllers[chatId]) {
     try {
@@ -158,27 +165,31 @@ async function autoplay(chatId, jobId) {
   if (!session?.book_key || !isAlive(chatId, jobId)) return;
 
   const book = await getBookByKey(session.book_key);
-  if (!book || !book.parts.length) return sendMessage(chatId, "❌ Книга не найдена в кэше.");
+  if (!book) return sendMessage(chatId, "❌ Книга не найдена в базе.");
 
-  let index = session.part_index || 0;
+  let index = Number(session.part_index || 0);
 
   while (index < book.parts.length) {
     if (!isAlive(chatId, jobId)) return;
 
     await sendMessage(chatId, `🎙 Часть ${index + 1}/${book.parts.length}`);
 
-    const controller = new AbortController();
-    controllers[chatId] = controller;
+    let audio = await getCachedAudio(book.key, index);
 
-    let audio;
-    try {
-      audio = await elevenLabsTTS(book.parts[index], controller.signal);
-    } catch (e) {
-      if (e.name === "CanceledError" || e.code === "ERR_CANCELED") return;
-      throw e;
+    if (!audio) {
+      const controller = new AbortController();
+      controllers[chatId] = controller;
+
+      try {
+        audio = await elevenLabsTTS(book.parts[index], controller.signal);
+        await saveAudioCache(book.key, index, audio);
+      } catch (e) {
+        if (e.name === "CanceledError" || e.code === "ERR_CANCELED") return;
+        throw e;
+      } finally {
+        delete controllers[chatId];
+      }
     }
-
-    delete controllers[chatId];
 
     if (!isAlive(chatId, jobId)) return;
 
@@ -197,7 +208,7 @@ async function autoplay(chatId, jobId) {
       job_id: jobId
     });
 
-    await sleep(800);
+    await sleep(500);
   }
 
   if (isAlive(chatId, jobId)) {
@@ -206,7 +217,8 @@ async function autoplay(chatId, jobId) {
 }
 
 async function getOrCreateBook(query) {
-  const key = hash(query.toLowerCase().trim());
+  const detected = detectKnownRussianBook(query);
+  const key = detected ? detected.key : hash(query.toLowerCase().trim());
 
   const cached = await getBookByKey(key);
   if (cached) {
@@ -216,10 +228,13 @@ async function getOrCreateBook(query) {
 
   console.log("BOOK CACHE MISS:", query);
 
-  let book = await loadFromWikisource(query);
+  let book = null;
+
+  if (detected?.source === "ilibrary") {
+    book = await loadFromILibrary(detected);
+  }
 
   if (!book || !book.text || book.text.length < 1000) {
-    console.log("WIKISOURCE FAILED, TRY GUTENBERG");
     book = await loadFromGutenberg(normalizeForGutenberg(query));
   }
 
@@ -227,135 +242,99 @@ async function getOrCreateBook(query) {
 
   const parts = splitText(book.text, 1700)
     .filter(p => p.length > 250)
-    .slice(0, 120);
-
-  if (!parts.length) return null;
+    .slice(0, 160);
 
   await pool.query(
     `INSERT INTO books (key, query, title, source, parts)
      VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (key) DO UPDATE SET title=$3, source=$4, parts=$5`,
+     ON CONFLICT (key)
+     DO UPDATE SET title=$3, source=$4, parts=$5`,
     [key, query, book.title, book.source, JSON.stringify(parts)]
   );
 
-  return {
-    key,
-    title: book.title,
-    source: book.source,
-    parts
-  };
+  return { key, title: book.title, source: book.source, parts };
 }
 
-async function loadFromWikisource(query) {
-  const title = await findWikiTitle(query);
-  if (!title) return null;
+function detectKnownRussianBook(query) {
+  const t = query.toLowerCase();
 
-  const mainText = await getWikiPlainText(title);
-
-  let fullText = cleanWikiText(mainText);
-
-  if (fullText.length < 2000) {
-    const chapters = await getWikiLinks(title);
-
-    for (const ch of chapters.slice(0, 20)) {
-      const t = await getWikiPlainText(ch);
-      fullText += "\n\n" + cleanWikiText(t);
-
-      if (fullText.length > 60000) break;
-    }
+  if (t.includes("преступление")) {
+    return {
+      key: "ru_crime_and_punishment",
+      title: "Преступление и наказание",
+      source: "ilibrary",
+      baseUrl: "https://ilibrary.ru/text/69/p.",
+      maxPages: 90
+    };
   }
 
-  return {
-    title,
-    source: "wikisource",
-    text: fullText
-  };
+  return null;
 }
 
-async function findWikiTitle(query) {
-  const res = await axios.get(WIKI_API, {
-    params: {
-      action: "opensearch",
-      search: query,
-      limit: 5,
-      namespace: 0,
-      format: "json"
-    },
-    timeout: 15000,
-    headers: {
-      "User-Agent": "BookVoiceAI/1.0"
-    }
-  });
+async function loadFromILibrary(book) {
+  let full = "";
 
-  const titles = res.data?.[1] || [];
-  return titles[0] || null;
-}
+  for (let i = 1; i <= book.maxPages; i++) {
+    try {
+      const url = `${book.baseUrl}${i}/index.html`;
 
-async function getWikiLinks(title) {
-  try {
-    const res = await axios.get(WIKI_API, {
-      params: {
-        action: "parse",
-        page: title,
-        prop: "links",
-        format: "json"
-      },
-      timeout: 20000,
-      headers: {
-        "User-Agent": "BookVoiceAI/1.0"
+      const res = await axios.get(url, {
+        timeout: 15000,
+        responseType: "text",
+        headers: { "User-Agent": "BookVoiceAI/1.0" }
+      });
+
+      const text = cleanILibraryText(res.data);
+
+      if (text.length > 300) {
+        full += "\n\n" + text;
       }
-    });
 
-    const links = res.data?.parse?.links || [];
+      if (full.length > 220000) break;
 
-    return links
-      .filter(l => l.ns === 0)
-      .map(l => l["*"])
-      .filter(t =>
-        /глава|часть|^[IVXLCDM]+$|^\d+$/i.test(t) ||
-        t.includes(title + "/")
-      )
-      .slice(0, 50);
-
-  } catch {
-    return [];
+    } catch (e) {
+      break;
+    }
   }
+
+  return {
+    title: book.title,
+    source: "ilibrary",
+    text: full.trim()
+  };
 }
 
-async function getWikiPlainText(title) {
-  const res = await axios.get(WIKI_API, {
-    params: {
-      action: "query",
-      prop: "extracts",
-      titles: title,
-      explaintext: 1,
-      exsectionformat: "plain",
-      format: "json"
-    },
-    timeout: 20000,
-    headers: {
-      "User-Agent": "BookVoiceAI/1.0"
-    }
-  });
+function cleanILibraryText(html) {
+  let text = String(html || "");
 
-  const pages = res.data?.query?.pages || {};
-  const page = Object.values(pages)[0];
+  text = text
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&quot;/g, '"')
+    .replace(/&laquo;/g, "«")
+    .replace(/&raquo;/g, "»")
+    .replace(/&mdash;/g, "—")
+    .replace(/&ndash;/g, "–")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
 
-  return page?.extract || "";
+  text = text.replace(/^[\s\S]*?Преступление и наказание/i, "Преступление и наказание");
+
+  return text;
 }
 
 async function loadFromGutenberg(query) {
   const res = await axios.get("https://gutendex.com/books/", {
     params: { search: query },
     timeout: 15000,
-    headers: {
-      "User-Agent": "BookVoiceAI/1.0"
-    }
+    headers: { "User-Agent": "BookVoiceAI/1.0" }
   });
 
   const books = res.data.results || [];
   const book = books.find(b => b.copyright !== true);
-
   if (!book) return null;
 
   const url =
@@ -368,13 +347,11 @@ async function loadFromGutenberg(query) {
   const txt = await axios.get(url, {
     timeout: 25000,
     responseType: "text",
-    headers: {
-      "User-Agent": "BookVoiceAI/1.0"
-    }
+    headers: { "User-Agent": "BookVoiceAI/1.0" }
   });
 
   return {
-    title: book.title,
+    title: translateTitle(book.title),
     source: "gutenberg",
     text: cleanGutenbergText(txt.data)
   };
@@ -401,19 +378,16 @@ function normalizeForGutenberg(text) {
   return text;
 }
 
-function cleanWikiText(text) {
-  return String(text || "")
-    .replace(/\r/g, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .replace(/\[[^\]]*\]/g, "")
-    .replace(/\{[^}]*\}/g, "")
-    .replace(/↑/g, "")
-    .replace(/См. также[\s\S]*$/i, "")
-    .replace(/Примечания[\s\S]*$/i, "")
-    .replace(/Источники[\s\S]*$/i, "")
-    .replace(/[ \t]{2,}/g, " ")
-    .trim()
-    .slice(0, 200000);
+function translateTitle(title) {
+  const map = {
+    "Crime and Punishment": "Преступление и наказание",
+    "Anna Karenina": "Анна Каренина",
+    "War and Peace": "Война и мир",
+    "The Idiot": "Идиот",
+    "The Brothers Karamazov": "Братья Карамазовы"
+  };
+
+  return map[title] || title;
 }
 
 function cleanGutenbergText(text) {
@@ -428,7 +402,7 @@ function cleanGutenbergText(text) {
     .replace(/[ \t]{2,}/g, " ")
     .replace(/_/g, "")
     .trim()
-    .slice(0, 200000);
+    .slice(0, 220000);
 }
 
 function splitText(text, maxLength) {
@@ -448,7 +422,6 @@ function splitText(text, maxLength) {
   }
 
   if (current.trim()) parts.push(current.trim());
-
   return parts;
 }
 
@@ -521,6 +494,25 @@ async function getBookByKey(key) {
     source: row.source,
     parts: row.parts
   };
+}
+
+async function getCachedAudio(bookKey, partIndex) {
+  const r = await pool.query(
+    "SELECT audio FROM audio_cache WHERE book_key=$1 AND part_index=$2",
+    [bookKey, partIndex]
+  );
+
+  if (!r.rows.length) return null;
+  return r.rows[0].audio;
+}
+
+async function saveAudioCache(bookKey, partIndex, audio) {
+  await pool.query(
+    `INSERT INTO audio_cache (book_key, part_index, audio)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (book_key, part_index) DO NOTHING`,
+    [bookKey, partIndex, audio]
+  );
 }
 
 async function getSession(chatId) {

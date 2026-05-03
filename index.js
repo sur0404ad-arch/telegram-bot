@@ -51,45 +51,35 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     }
 
     await sendMessage(chatId, `📖 Нашёл книгу:\n${bookTitle}`);
-    await sendMessage(chatId, "📚 Ищу главы...");
+    await sendMessage(chatId, "📥 Загружаю текст...");
 
-    const chapters = await findChapters(bookTitle);
+    const fullText = await getBookText(bookTitle);
 
-    if (!chapters.length) {
-      await sendMessage(chatId, "❌ Нашёл книгу, но не нашёл главы.");
+    console.log("FULL TEXT LENGTH:", fullText.length);
+
+    if (fullText.length < 500) {
+      await sendMessage(chatId, "❌ Не удалось получить текст книги.");
       return;
     }
 
-    const firstChapter = chapters[0];
+    const parts = splitText(fullText, 1800).slice(0, 10);
 
-    await sendMessage(chatId, `🎬 Начинаю как сериал:\n\n${firstChapter}`);
+    await sendMessage(chatId, "🎬 Начинаю чтение как сериал...");
 
-    const chapterText = await getPageExtract(firstChapter);
-    const clean = cleanText(chapterText);
+    for (let i = 0; i < parts.length; i++) {
+      await sendMessage(chatId, `🎙 Часть ${i + 1}/${parts.length}`);
 
-    console.log("CHAPTER TEXT LENGTH:", clean.length);
-
-    if (clean.length < 300) {
-      await sendMessage(chatId, "❌ Глава найдена, но текста мало.");
-      return;
-    }
-
-    const chunks = splitText(clean, 1600).slice(0, 5);
-
-    for (let i = 0; i < chunks.length; i++) {
-      await sendMessage(chatId, `🎙 Глава 1 — часть ${i + 1}/${chunks.length}`);
-
-      const audio = await elevenLabsTTS(chunks[i]);
+      const audio = await elevenLabsTTS(parts[i]);
 
       await sendAudio(
         chatId,
         audio,
-        `chapter_1_part_${i + 1}.mp3`,
-        `📖 ${bookTitle}\n🎬 Глава 1\nЧасть ${i + 1}`
+        `part_${i + 1}.mp3`,
+        `📖 ${bookTitle}\nЧасть ${i + 1}`
       );
     }
 
-    await sendMessage(chatId, "✅ Глава 1 отправлена. Потом сделаем кнопку «Следующая глава».");
+    await sendMessage(chatId, "✅ Готово. Первые части отправлены.");
 
   } catch (error) {
     console.log("SERVER ERROR:", error.response?.data || error.message || error);
@@ -140,14 +130,22 @@ async function findBookTitle(query) {
   return good ? good.title : null;
 }
 
-async function findChapters(bookTitle) {
+async function getBookText(title) {
+  let text = await getPageExtract(title);
+
+  if (text.length > 1500) {
+    return cleanText(text);
+  }
+
+  console.log("MAIN PAGE SHORT, TRY SUBPAGES");
+
   const res = await axios.get(WIKI_API, {
     params: {
       action: "query",
       list: "allpages",
-      apprefix: bookTitle + "/",
+      apprefix: title + "/",
       apnamespace: 0,
-      aplimit: 100,
+      aplimit: 50,
       format: "json"
     },
     headers: HEADERS,
@@ -155,45 +153,19 @@ async function findChapters(bookTitle) {
   });
 
   const pages = res.data.query?.allpages || [];
-  let titles = pages.map(p => p.title);
 
-  titles = titles.filter(t =>
-    !t.includes("Оглавление") &&
-    !t.includes("Предисловие") &&
-    !t.includes("Примечания") &&
-    !t.includes("Комментарии")
-  );
+  console.log("SUBPAGES:", pages.map(p => p.title));
 
-  titles.sort((a, b) => chapterNumber(a) - chapterNumber(b));
+  let full = "";
 
-  console.log("CHAPTERS:", titles);
+  for (const p of pages) {
+    const part = await getPageExtract(p.title);
+    full += "\n\n" + part;
 
-  return titles;
-}
+    if (full.length > 20000) break;
+  }
 
-function chapterNumber(title) {
-  const lower = title.toLowerCase();
-
-  const map = {
-    "i": 1,
-    "ii": 2,
-    "iii": 3,
-    "iv": 4,
-    "v": 5,
-    "vi": 6,
-    "vii": 7,
-    "viii": 8,
-    "ix": 9,
-    "x": 10
-  };
-
-  const roman = lower.match(/\/([ivx]+)$/i);
-  if (roman && map[roman[1].toLowerCase()]) return map[roman[1].toLowerCase()];
-
-  const num = lower.match(/(\d+)/);
-  if (num) return Number(num[1]);
-
-  return 999;
+  return cleanText(full || text);
 }
 
 async function getPageExtract(title) {
@@ -213,7 +185,11 @@ async function getPageExtract(title) {
   const pages = res.data.query?.pages || {};
   const page = Object.values(pages)[0];
 
-  return page?.extract || "";
+  const extract = page?.extract || "";
+
+  console.log("EXTRACT:", title, extract.length);
+
+  return extract;
 }
 
 function cleanText(text) {
@@ -236,7 +212,7 @@ function splitText(text, maxLength) {
   let current = "";
 
   for (const s of sentences) {
-    if ((current + s).length > maxLength) {
+    if ((current + " " + s).length > maxLength) {
       if (current.trim()) chunks.push(current.trim());
       current = s;
     } else {

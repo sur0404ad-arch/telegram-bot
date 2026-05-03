@@ -11,19 +11,20 @@ const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;
 
 const sessions = new Map();
 
-async function tg(method, payload) {
-  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  if (!res.ok) throw new Error(await res.text());
-  return res.json();
-}
+const BOOK_MAP = {
+  "преступление и наказание": "Преступление и наказание (Достоевский)",
+  "капитанская дочка": "Капитанская дочка (Пушкин)/1978 (СО)",
+  "шинель": "Шинель (Гоголь)/ПСС 1938 (СО)",
+  "война и мир": "Война и мир (Толстой)",
+  "анна каренина": "Анна Каренина (Толстой)",
+};
 
 async function sendText(chatId, text) {
-  return tg("sendMessage", { chat_id: chatId, text });
+  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text }),
+  });
 }
 
 async function sendAudio(chatId, audioBuffer, filename) {
@@ -34,13 +35,11 @@ async function sendAudio(chatId, audioBuffer, filename) {
     contentType: "audio/mpeg",
   });
 
-  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendAudio`, {
+  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendAudio`, {
     method: "POST",
     headers: form.getHeaders(),
     body: form,
   });
-
-  if (!res.ok) throw new Error(await res.text());
 }
 
 async function makeVoice(text) {
@@ -56,10 +55,6 @@ async function makeVoice(text) {
       body: JSON.stringify({
         text,
         model_id: "eleven_multilingual_v2",
-        voice_settings: {
-          stability: 0.55,
-          similarity_boost: 0.8,
-        },
       }),
     }
   );
@@ -70,79 +65,6 @@ async function makeVoice(text) {
 
 function cleanText(text) {
   return text
-    .replace(/\r/g, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .replace(/\s{2,}/g, " ")
-    .replace(/\*\*\* START[\s\S]*?\*\*\*/i, "")
-    .replace(/\*\*\* END[\s\S]*/i, "")
-    .trim();
-}
-
-function splitText(text, max = 1800) {
-  const parts = [];
-  let rest = text;
-
-  while (rest.length > 0) {
-    let part = rest.slice(0, max);
-    const cut = Math.max(
-      part.lastIndexOf("."),
-      part.lastIndexOf("!"),
-      part.lastIndexOf("?"),
-      part.lastIndexOf("\n")
-    );
-
-    if (cut > 800) part = part.slice(0, cut + 1);
-
-    parts.push(part.trim());
-    rest = rest.slice(part.length).trim();
-  }
-
-  return parts.filter(Boolean);
-}
-
-async function searchGutendex(query) {
-  const url = `https://gutendex.com/books?search=${encodeURIComponent(query)}`;
-  const data = await fetch(url).then((r) => r.json());
-
-  if (!data.results || !data.results.length) return null;
-
-  const book = data.results[0];
-  const textUrl =
-    book.formats["text/plain; charset=utf-8"] ||
-    book.formats["text/plain; charset=us-ascii"] ||
-    book.formats["text/plain"];
-
-  if (!textUrl) return null;
-
-  const raw = await fetch(textUrl).then((r) => r.text());
-
-  return {
-    title: book.title,
-    source: "Project Gutenberg",
-    text: cleanText(raw),
-  };
-}
-
-async function searchWikisource(query) {
-  const searchUrl =
-    "https://ru.wikisource.org/w/api.php?action=opensearch&format=json&limit=5&search=" +
-    encodeURIComponent(query);
-
-  const data = await fetch(searchUrl).then((r) => r.json());
-  const title = data?.[1]?.[0];
-
-  if (!title) return null;
-
-  const pageUrl =
-    "https://ru.wikisource.org/w/api.php?action=parse&format=json&prop=text&page=" +
-    encodeURIComponent(title);
-
-  const page = await fetch(pageUrl).then((r) => r.json());
-  const html = page?.parse?.text?.["*"];
-
-  if (!html) return null;
-
-  const text = html
     .replace(/<style[\s\S]*?<\/style>/g, "")
     .replace(/<script[\s\S]*?<\/script>/g, "")
     .replace(/<[^>]+>/g, " ")
@@ -152,62 +74,113 @@ async function searchWikisource(query) {
     .replace(/\[[^\]]*\]/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
 
-  if (text.length < 1000) return null;
+function splitText(text, max = 1800) {
+  const parts = [];
+  let rest = text;
+
+  while (rest.length > 0) {
+    let part = rest.slice(0, max);
+    const cut = Math.max(part.lastIndexOf("."), part.lastIndexOf("!"), part.lastIndexOf("?"));
+
+    if (cut > 700) part = part.slice(0, cut + 1);
+
+    parts.push(part.trim());
+    rest = rest.slice(part.length).trim();
+  }
+
+  return parts.filter(Boolean);
+}
+
+async function getWikisourcePage(title) {
+  const url =
+    "https://ru.wikisource.org/w/api.php?action=parse&format=json&prop=text|links&page=" +
+    encodeURIComponent(title);
+
+  const data = await fetch(url).then((r) => r.json());
+
+  if (!data.parse) return null;
 
   return {
-    title,
-    source: "Wikisource",
-    text,
+    title: data.parse.title,
+    html: data.parse.text?.["*"] || "",
+    links: data.parse.links || [],
   };
 }
 
-async function findBook(query) {
-  const sources = [
-    () => searchWikisource(query),
-    () => searchGutendex(query),
-  ];
+async function findWikisourceTitle(query) {
+  const key = query.toLowerCase().replace(/[«»"]/g, "").trim();
 
-  for (const source of sources) {
-    try {
-      const book = await source();
-      if (book && book.text && book.text.length > 1000) return book;
-    } catch (e) {
-      console.log("SOURCE ERROR:", e.message);
-    }
-  }
+  if (BOOK_MAP[key]) return BOOK_MAP[key];
 
-  return null;
+  const url =
+    "https://ru.wikisource.org/w/api.php?action=opensearch&format=json&limit=10&search=" +
+    encodeURIComponent(query);
+
+  const data = await fetch(url).then((r) => r.json());
+  return data?.[1]?.[0] || null;
 }
 
-async function readBookStream(chatId, book) {
-  const parts = splitText(book.text, 1800);
+async function findBook(query) {
+  const title = await findWikisourceTitle(query);
+  if (!title) return null;
 
-  sessions.set(chatId, {
-    active: true,
-    title: book.title,
-    index: 0,
-  });
+  const main = await getWikisourcePage(title);
+  if (!main) return null;
 
-  await sendText(
-    chatId,
-    `Нашёл: ${book.title}\nИсточник: ${book.source}\nНачинаю читать потоком.\nКоманда остановки: /stop`
-  );
+  let text = cleanText(main.html);
+
+  if (text.length > 5000) {
+    return { title: main.title, text };
+  }
+
+  const childTitles = main.links
+    .map((l) => l["*"])
+    .filter((x) => x && x.startsWith(main.title + "/"))
+    .slice(0, 30);
+
+  let fullText = "";
+
+  for (const childTitle of childTitles) {
+    const child = await getWikisourcePage(childTitle);
+    if (!child) continue;
+
+    const childText = cleanText(child.html);
+
+    if (childText.length > 500) {
+      fullText += "\n\n" + childText;
+    }
+
+    if (fullText.length > 40000) break;
+  }
+
+  if (fullText.length < 1000) return null;
+
+  return {
+    title: main.title,
+    text: fullText,
+  };
+}
+
+async function readBook(chatId, book) {
+  const parts = splitText(book.text);
+
+  sessions.set(chatId, { active: true });
+
+  await sendText(chatId, `Нашёл: ${book.title}\nНачинаю читать потоком.\nОстановить: /stop`);
 
   for (let i = 0; i < parts.length; i++) {
     const session = sessions.get(chatId);
-
     if (!session || !session.active) {
       await sendText(chatId, "Чтение остановлено.");
       return;
     }
 
-    session.index = i;
-
     const audio = await makeVoice(parts[i]);
     await sendAudio(chatId, audio, `part_${i + 1}.mp3`);
 
-    await new Promise((resolve) => setTimeout(resolve, 1500));
+    await new Promise((r) => setTimeout(r, 1000));
   }
 
   sessions.delete(chatId);
@@ -229,22 +202,18 @@ app.post("/", async (req, res) => {
     const text = message.text.trim();
 
     if (text === "/start") {
-      await sendText(
-        chatId,
-        "Напиши название книги. Я найду легальный открытый текст и начну читать голосом."
-      );
+      await sendText(chatId, "Напиши название книги.");
       return;
     }
 
     if (text === "/stop") {
       const session = sessions.get(chatId);
       if (session) session.active = false;
-      await sendText(chatId, "Останавливаю чтение.");
       return;
     }
 
     if (sessions.get(chatId)?.active) {
-      await sendText(chatId, "Сейчас уже идёт чтение. Напиши /stop, чтобы остановить.");
+      await sendText(chatId, "Уже читаю. Напиши /stop, чтобы остановить.");
       return;
     }
 
@@ -253,20 +222,17 @@ app.post("/", async (req, res) => {
     const book = await findBook(text);
 
     if (!book) {
-      await sendText(
-        chatId,
-        "Не нашёл легальный открытый текст этой книги.\n\nПопробуй:\n- Преступление и наказание\n- Война и мир\n- Капитанская дочка\n- Шинель\n- Анна Каренина\n\nЕсли книга современная или защищена авторским правом — пришли текст, и я озвучу."
-      );
+      await sendText(chatId, "Не нашёл текст. Попробуй: Преступление и наказание, Капитанская дочка, Шинель.");
       return;
     }
 
-    readBookStream(chatId, book).catch(async (error) => {
-      console.log("STREAM ERROR:", error.message);
-      await sendText(chatId, "Ошибка чтения:\n" + error.message);
+    readBook(chatId, book).catch(async (err) => {
+      console.log("STREAM ERROR:", err.message);
+      await sendText(chatId, "Ошибка чтения:\n" + err.message);
       sessions.delete(chatId);
     });
-  } catch (error) {
-    console.log("ERROR:", error.message);
+  } catch (err) {
+    console.log("ERROR:", err.message);
   }
 });
 

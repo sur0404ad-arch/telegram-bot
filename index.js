@@ -89,7 +89,7 @@ function htmlToText(html) {
     .trim();
 }
 
-function splitText(text, max = 900) {
+splitText(book.text, 3500)
   const parts = [];
   let rest = prepareForVoice(text);
 

@@ -3,7 +3,7 @@ const axios = require("axios");
 const FormData = require("form-data");
 
 const app = express();
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json());
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
@@ -12,222 +12,209 @@ const PORT = process.env.PORT || 3000;
 
 const TG = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
-app.get("/", (req, res) => res.send("SERVER RUNNING"));
+// память пользователей
+const sessions = {};
+
+app.get("/", (req, res) => res.send("OK"));
 
 app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
   res.sendStatus(200);
 
   try {
     const msg = req.body.message;
-    if (!msg?.chat?.id || !msg?.text) return;
+    if (!msg?.text) return;
 
     const chatId = msg.chat.id;
-    const query = msg.text.trim();
+    const text = msg.text.trim();
 
-    console.log("USER:", query);
+    console.log("USER:", text);
 
-    if (query === "/start") {
+    // --- STOP ---
+    if (text === "/stop") {
+      sessions[chatId] = { stopped: true };
+      await sendMessage(chatId, "⏹ Остановлено");
+      return;
+    }
+
+    // --- NEXT ---
+    if (text === "▶️ Следующая часть") {
+      return sendNextPart(chatId);
+    }
+
+    // --- START ---
+    if (text === "/start") {
       await sendMessage(
         chatId,
-        "📚 Напиши название книги на английском.\n\nПример:\nCrime and Punishment"
+        "📚 Напиши книгу\n\nПример:\nCrime and Punishment"
       );
       return;
     }
 
-    if (isBlocked(query)) {
-      await sendMessage(chatId, "❌ Книга защищена авторским правом.");
-      return;
-    }
+    // новая сессия
+    sessions[chatId] = {
+      stopped: false,
+      parts: [],
+      index: 0,
+      title: ""
+    };
 
     await sendMessage(chatId, "🔎 Ищу книгу...");
-    const book = await findBook(query);
+
+    const book = await findBook(text);
 
     if (!book) {
-      await sendMessage(chatId, "❌ Не нашёл книгу.");
+      await sendMessage(chatId, "❌ Не нашёл книгу");
       return;
     }
 
-    await sendMessage(chatId, `📖 Нашёл:\n${book.title}`);
+    sessions[chatId].title = book.title;
+
+    await sendMessage(chatId, `📖 ${book.title}`);
     await sendMessage(chatId, "📥 Загружаю текст...");
 
-    const fullText = await loadText(book.url);
+    const raw = await loadText(book.url);
 
-    console.log("TEXT LENGTH:", fullText.length);
-
-    if (fullText.length < 1000) {
-      await sendMessage(chatId, "❌ Текст не загрузился нормально.");
+    if (raw.length < 1000) {
+      await sendMessage(chatId, "❌ Ошибка загрузки текста");
       return;
     }
 
-    const parts = splitText(fullText, 1800)
-      .filter((p) => p.length > 300)
-      .slice(0, 8);
+    const parts = split(raw, 1800)
+      .filter(p => p.length > 300)
+      .slice(0, 50);
 
-    await sendMessage(chatId, `🎬 Начинаю чтение как Netflix.\nЧастей: ${parts.length}`);
+    sessions[chatId].parts = parts;
 
-    for (let i = 0; i < parts.length; i++) {
-      await sendMessage(chatId, `🎙 Часть ${i + 1}/${parts.length}`);
+    await sendMessage(chatId, "🎬 Начинаю...");
+    await sendNextPart(chatId);
 
-      const audio = await elevenLabsTTS(parts[i]);
-
-      await sendAudio(
-        chatId,
-        audio,
-        `part_${i + 1}.mp3`,
-        `📖 ${book.title}\n🎬 Часть ${i + 1}/${parts.length}`
-      );
-    }
-
-    await sendMessage(chatId, "✅ Готово. Первые части отправлены.");
-
-  } catch (error) {
-    console.log("SERVER ERROR:", error.response?.data || error.message || error);
+  } catch (e) {
+    console.log("ERROR:", e.message);
   }
 });
 
-function isBlocked(text) {
-  const t = text.toLowerCase();
+// --- SEND NEXT PART ---
+async function sendNextPart(chatId) {
+  const session = sessions[chatId];
+  if (!session || session.stopped) return;
 
-  return [
-    "harry potter",
-    "гарри поттер",
-    "rowling",
-    "роулинг",
-    "stephen king",
-    "стивен кинг"
-  ].some((x) => t.includes(x));
+  const { parts, index, title } = session;
+
+  if (index >= parts.length) {
+    await sendMessage(chatId, "📕 Конец");
+    return;
+  }
+
+  const text = parts[index];
+
+  await sendMessage(chatId, `🎙 Часть ${index + 1}`);
+
+  const audio = await tts(text);
+
+  if (sessions[chatId]?.stopped) return; // 💣 моментальная остановка
+
+  await sendAudio(chatId, audio, `part_${index}.mp3`);
+
+  session.index++;
+
+  await sendMessage(chatId, "▶️ Следующая часть", {
+    keyboard: [["▶️ Следующая часть"], ["/stop"]],
+    resize_keyboard: true
+  });
 }
 
-async function findBook(query) {
-  const res = await axios.get("https://gutendex.com/books/", {
-    params: {
-      search: query
-    },
-    timeout: 15000,
-    headers: {
-      "User-Agent": "BookVoiceAI/1.0"
-    }
-  });
+// --- FIND BOOK ---
+async function findBook(q) {
+  const res = await axios.get(
+    `https://gutendex.com/books/?search=${encodeURIComponent(q)}`
+  );
 
-  const books = res.data.results || [];
-  const book = books.find((b) => b.copyright !== true);
+  const book = res.data.results.find(b => !b.copyright);
 
   if (!book) return null;
 
   const url =
     book.formats["text/plain; charset=utf-8"] ||
-    book.formats["text/plain; charset=us-ascii"] ||
     book.formats["text/plain"];
 
-  if (!url) return null;
-
-  return {
-    title: book.title,
-    url
-  };
+  return { title: book.title, url };
 }
 
+// --- LOAD TEXT ---
 async function loadText(url) {
   const res = await axios.get(url, {
-    timeout: 25000,
+    timeout: 20000,
     responseType: "text",
-    headers: {
-      "User-Agent": "BookVoiceAI/1.0"
-    }
+    headers: { "User-Agent": "Mozilla/5.0" }
   });
 
-  return cleanBookText(res.data);
+  return clean(res.data);
 }
 
-function cleanBookText(text) {
-  let t = String(text || "");
-
-  t = t.replace(/[\s\S]*?\*\*\* START OF (THIS|THE) PROJECT GUTENBERG EBOOK[\s\S]*?\*\*\*/i, "");
-  t = t.replace(/\*\*\* END OF (THIS|THE) PROJECT GUTENBERG EBOOK[\s\S]*/i, "");
-
-  t = t
+// --- CLEAN ---
+function clean(t) {
+  return t
+    .replace(/[\s\S]*?START OF (THIS|THE) PROJECT GUTENBERG EBOOK/i, "")
+    .replace(/END OF (THIS|THE) PROJECT GUTENBERG EBOOK[\s\S]*/i, "")
     .replace(/\r/g, "")
     .replace(/\n{3,}/g, "\n\n")
-    .replace(/[ \t]{2,}/g, " ")
-    .replace(/_/g, "")
     .trim();
-
-  return t.slice(0, 60000);
 }
 
-function splitText(text, maxLength) {
-  const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
-  const parts = [];
-  let current = "";
+// --- SPLIT ---
+function split(text, max) {
+  const out = [];
+  let cur = "";
 
-  for (const sentence of sentences) {
-    const s = sentence.trim();
-
-    if ((current + " " + s).length > maxLength) {
-      if (current.trim()) parts.push(current.trim());
-      current = s;
+  for (let s of text.split(".")) {
+    if ((cur + s).length > max) {
+      out.push(cur);
+      cur = s;
     } else {
-      current += " " + s;
+      cur += s + ".";
     }
   }
 
-  if (current.trim()) parts.push(current.trim());
-
-  return parts;
+  if (cur) out.push(cur);
+  return out;
 }
 
-async function elevenLabsTTS(text) {
+// --- TTS ---
+async function tts(text) {
   const res = await axios.post(
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
-    {
-      text,
-      model_id: "eleven_multilingual_v2",
-      voice_settings: {
-        stability: 0.45,
-        similarity_boost: 0.8,
-        style: 0.35,
-        use_speaker_boost: true
-      }
-    },
+    { text },
     {
       headers: {
         "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json",
         Accept: "audio/mpeg"
       },
-      responseType: "arraybuffer",
-      timeout: 60000
+      responseType: "arraybuffer"
     }
   );
 
   return Buffer.from(res.data);
 }
 
-async function sendMessage(chatId, text) {
+// --- SEND ---
+async function sendMessage(chatId, text, extra = {}) {
   await axios.post(`${TG}/sendMessage`, {
     chat_id: chatId,
-    text
+    text,
+    reply_markup: extra.keyboard
+      ? { keyboard: extra.keyboard }
+      : undefined
   });
 }
 
-async function sendAudio(chatId, audioBuffer, filename, caption) {
+async function sendAudio(chatId, buffer, name) {
   const form = new FormData();
-
   form.append("chat_id", chatId);
-  form.append("caption", caption);
-  form.append("audio", audioBuffer, {
-    filename,
-    contentType: "audio/mpeg"
-  });
+  form.append("audio", buffer, { filename: name });
 
   await axios.post(`${TG}/sendAudio`, form, {
-    headers: form.getHeaders(),
-    maxContentLength: Infinity,
-    maxBodyLength: Infinity,
-    timeout: 60000
+    headers: form.getHeaders()
   });
 }
 
-app.listen(PORT, () => {
-  console.log(`SERVER RUNNING ON ${PORT}`);
-});
+app.listen(PORT, () => console.log("SERVER RUNNING"));

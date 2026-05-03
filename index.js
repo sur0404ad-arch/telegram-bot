@@ -193,6 +193,7 @@ async function autoplay(chatId, jobId) {
 
     if (!isAlive(chatId, jobId)) return;
 
+   if (!isAlive(chatId, jobId)) return;
     await sendAudio(
       chatId,
       audio,

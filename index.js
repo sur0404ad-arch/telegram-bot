@@ -1,4 +1,6 @@
-console.log("NEW VERSION LOADED");const express = require("express");
+console.log("NEW VERSION LOADED");
+
+const express = require("express");
 const fetch = require("node-fetch");
 const FormData = require("form-data");
 

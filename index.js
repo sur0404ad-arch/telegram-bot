@@ -1,4 +1,4 @@
-console.log("FINAL VOICE VERSION STARTED");
+console.log("NETFLIX READER VERSION STARTED");
 
 const express = require("express");
 const fetch = require("node-fetch");
@@ -81,14 +81,27 @@ function cleanVoiceText(text) {
 }
 
 function addNarrationStyle(text) {
-  return `Он говорил спокойно. Тихо. С небольшими паузами.\n\n${text}`;
+  let t = cleanVoiceText(text);
+
+  t = t
+    .replace(/([.!?])\s+/g, "$1...\n\n")
+    .replace(/,\s+/g, ", ")
+    .replace(/—/g, " — ")
+    .replace(/«/g, "«")
+    .replace(/»/g, "»")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return `Читает спокойный тёплый мужской голос. Медленно. Атмосферно. С паузами. Без спешки.
+
+${t}`;
 }
 
 function splitParts(text) {
   const clean = cleanVoiceText(text);
   const parts = [];
 
-  let first = clean.slice(0, 650);
+  let first = clean.slice(0, 500);
   let cut = Math.max(
     first.lastIndexOf("."),
     first.lastIndexOf("!"),
@@ -101,7 +114,7 @@ function splitParts(text) {
   let rest = clean.slice(first.length).trim();
 
   while (rest.length > 0 && parts.length < 12) {
-    let part = rest.slice(0, 2400);
+    let part = rest.slice(0, 2100);
 
     cut = Math.max(
       part.lastIndexOf("."),
@@ -109,7 +122,7 @@ function splitParts(text) {
       part.lastIndexOf("?")
     );
 
-    if (cut > 900) part = part.slice(0, cut + 1);
+    if (cut > 850) part = part.slice(0, cut + 1);
 
     parts.push(part.trim());
     rest = rest.slice(part.length).trim();
@@ -119,7 +132,7 @@ function splitParts(text) {
 }
 
 async function makeVoice(text) {
-  const finalText = addNarrationStyle(cleanVoiceText(text));
+  const finalText = addNarrationStyle(text);
 
   const res = await Promise.race([
     fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`, {
@@ -133,9 +146,9 @@ async function makeVoice(text) {
         text: finalText,
         model_id: "eleven_multilingual_v2",
         voice_settings: {
-          stability: 0.6,
-          similarity_boost: 0.78,
-          style: 0.42,
+          stability: 0.65,
+          similarity_boost: 0.8,
+          style: 0.48,
           use_speaker_boost: true,
         },
       }),
@@ -258,17 +271,17 @@ async function readBook(chatId, query) {
 
   await sendText(
     chatId,
-    "📖 Принял. Ищу начало книги. Сначала отправлю короткий голос, потом пойдут части."
+    "📖 Принял. Ищу начало книги. Сейчас отправлю короткое вступление, затем начну чтение."
   );
 
   const stopAlive = await keepAlive(chatId);
 
   try {
     const introAudio = await makeVoice(
-      `Начинаю подготовку книги: ${query}. Сейчас найду начало текста и отправлю первую часть.`
+      `Сегодня мы начинаем чтение книги: ${query}. Устройся поудобнее. Сейчас начнётся первая часть.`
     );
 
-    await sendAudio(chatId, introAudio, "intro.mp3", "Начинаю");
+    await sendAudio(chatId, introAudio, "intro.mp3", "Вступление");
   } catch (e) {
     console.log("INTRO ERROR:", e.message);
   }
@@ -287,7 +300,7 @@ async function readBook(chatId, query) {
 
   await sendText(
     chatId,
-    `Нашёл: ${book.title}\n\nОтправляю чтение.\nОстановить: /stop`
+    `Нашёл: ${book.title}\n\nНачинаю чтение.\nОстановить: /stop`
   );
 
   for (let i = 0; i < parts.length; i++) {
@@ -311,7 +324,7 @@ async function readBook(chatId, query) {
 }
 
 app.get("/", (req, res) => {
-  res.send("Final voice reader is running");
+  res.send("Netflix style reader is running");
 });
 
 app.post("/", async (req, res) => {
@@ -359,5 +372,5 @@ app.post("/", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log("FINAL VOICE VERSION STARTED");
+  console.log("NETFLIX READER VERSION STARTED");
 });

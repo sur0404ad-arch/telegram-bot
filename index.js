@@ -62,7 +62,60 @@ async function elevenLabs(text) {
   return await res.buffer();
 }
 
-async function searchWikisource(query) {
+async function searchBook(query) {
+  // 1. пробуем Gutenberg
+  const gut = await fetch(`https://gutendex.com/books?search=${encodeURIComponent(query)}`)
+    .then(r => r.json());
+
+  if (gut.results && gut.results.length > 0) {
+    const book = gut.results[0];
+
+    const url =
+      book.formats["text/plain; charset=utf-8"] ||
+      book.formats["text/plain"];
+
+    if (url) {
+      const text = await fetch(url).then(r => r.text());
+
+      return {
+        title: book.title,
+        text
+      };
+    }
+  }
+
+  // 2. fallback — Wikisource (старый метод)
+  const searchUrl =
+    "https://ru.wikisource.org/w/api.php?action=opensearch&format=json&limit=5&search=" +
+    encodeURIComponent(query);
+
+  const data = await fetch(searchUrl).then(r => r.json());
+  const title = data?.[1]?.[0];
+
+  if (!title) return null;
+
+  const pageUrl =
+    "https://ru.wikisource.org/w/api.php?action=parse&format=json&prop=text&page=" +
+    encodeURIComponent(title);
+
+  const page = await fetch(pageUrl).then(r => r.json());
+  const html = page?.parse?.text?.["*"];
+
+  if (!html) return null;
+
+  const cleanText = html
+    .replace(/<style[\s\S]*?<\/style>/g, "")
+    .replace(/<script[\s\S]*?<\/script>/g, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\[[^\]]*\]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return {
+    title,
+    text: cleanText
+  };
+}
   const searchUrl =
     "https://ru.wikisource.org/w/api.php?action=opensearch&format=json&limit=5&search=" +
     encodeURIComponent(query);

@@ -13,7 +13,13 @@ const PORT = process.env.PORT || 3000;
 const TG_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const WIKI_API = "https://ru.wikisource.org/w/api.php";
 
-app.get("/", (req, res) => res.send("SERVER RUNNING"));
+const HEADERS = {
+  "User-Agent": "BookVoiceAI/1.0 (Telegram bot; contact: book_voice_reader_bot)",
+};
+
+app.get("/", (req, res) => {
+  res.send("SERVER RUNNING");
+});
 
 app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
   res.sendStatus(200);
@@ -30,7 +36,7 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     if (userText === "/start") {
       await sendMessage(
         chatId,
-        "📚 Напиши название книги и автора.\n\nНапример:\nПреступление и наказание"
+        "📚 Напиши название книги.\n\nНапример:\nПреступление и наказание"
       );
       return;
     }
@@ -105,7 +111,8 @@ async function findWikisourcePage(query) {
       namespace: 0,
       format: "json"
     },
-    timeout: 10000
+    headers: HEADERS,
+    timeout: 15000
   });
 
   console.log("WIKI OPENSEARCH:", JSON.stringify(res.data));
@@ -129,7 +136,8 @@ async function getWikisourceText(title) {
       exsectionformat: "plain",
       format: "json"
     },
-    timeout: 15000
+    headers: HEADERS,
+    timeout: 20000
   });
 
   const pages = res.data.query?.pages || {};

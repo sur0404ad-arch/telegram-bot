@@ -11,14 +11,6 @@ const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;
 
 const sessions = new Map();
 
-const BOOK_MAP = {
-  "преступление и наказание": "Преступление и наказание (Достоевский)",
-  "капитанская дочка": "Капитанская дочка (Пушкин)/1978 (СО)",
-  "шинель": "Шинель (Гоголь)/ПСС 1938 (СО)",
-  "война и мир": "Война и мир (Толстой)",
-  "анна каренина": "Анна Каренина (Толстой)",
-};
-
 async function sendText(chatId, text) {
   await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     method: "POST",
@@ -42,7 +34,19 @@ async function sendAudio(chatId, audioBuffer, filename) {
   });
 }
 
+function prepareForVoice(text) {
+  return text
+    .replace(/Викитека|Материал из Викитеки/gi, "")
+    .replace(/Содержание|Править|править код|Источник/gi, "")
+    .replace(/\[[0-9]+\]/g, "")
+    .replace(/[^\p{L}\p{N}\s.,!?;:—\-«»"()]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 async function makeVoice(text) {
+  const clean = prepareForVoice(text);
+
   const res = await fetch(
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
     {
@@ -53,8 +57,14 @@ async function makeVoice(text) {
         Accept: "audio/mpeg",
       },
       body: JSON.stringify({
-        text,
+        text: clean,
         model_id: "eleven_multilingual_v2",
+        voice_settings: {
+          stability: 0.75,
+          similarity_boost: 0.9,
+          style: 0.12,
+          use_speaker_boost: true,
+        },
       }),
     }
   );
@@ -63,37 +73,54 @@ async function makeVoice(text) {
   return res.buffer();
 }
 
-function cleanText(text) {
-  return text
+function htmlToText(html) {
+  return html
     .replace(/<style[\s\S]*?<\/style>/g, "")
     .replace(/<script[\s\S]*?<\/script>/g, "")
+    .replace(/<sup[\s\S]*?<\/sup>/g, "")
+    .replace(/<table[\s\S]*?<\/table>/g, "")
+    .replace(/<div[^>]*(class="[^"]*(printfooter|catlinks|metadata|noprint|mw-editsection)[^"]*")[^>]*>[\s\S]*?<\/div>/gi, "")
     .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;/g, " ")
     .replace(/&quot;/g, '"')
     .replace(/&amp;/g, "&")
-    .replace(/\[[^\]]*\]/g, "")
+    .replace(/&#160;/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function splitText(text, max = 1800) {
+function splitText(text, max = 900) {
   const parts = [];
-  let rest = text;
+  let rest = prepareForVoice(text);
 
   while (rest.length > 0) {
     let part = rest.slice(0, max);
-    const cut = Math.max(part.lastIndexOf("."), part.lastIndexOf("!"), part.lastIndexOf("?"));
+    const cut = Math.max(
+      part.lastIndexOf("."),
+      part.lastIndexOf("!"),
+      part.lastIndexOf("?"),
+      part.lastIndexOf(";")
+    );
 
-    if (cut > 700) part = part.slice(0, cut + 1);
+    if (cut > 400) part = part.slice(0, cut + 1);
 
     parts.push(part.trim());
     rest = rest.slice(part.length).trim();
   }
 
-  return parts.filter(Boolean);
+  return parts.filter((p) => p.length > 50);
 }
 
-async function getWikisourcePage(title) {
+async function wikiSearch(query) {
+  const url =
+    "https://ru.wikisource.org/w/api.php?action=query&list=search&format=json&srlimit=10&srsearch=" +
+    encodeURIComponent(query);
+
+  const data = await fetch(url).then((r) => r.json());
+  return data?.query?.search?.map((x) => x.title) || [];
+}
+
+async function getWikiPage(title) {
   const url =
     "https://ru.wikisource.org/w/api.php?action=parse&format=json&prop=text|links&page=" +
     encodeURIComponent(title);
@@ -104,71 +131,71 @@ async function getWikisourcePage(title) {
 
   return {
     title: data.parse.title,
-    html: data.parse.text?.["*"] || "",
+    text: htmlToText(data.parse.text?.["*"] || ""),
     links: data.parse.links || [],
   };
 }
 
-async function findWikisourceTitle(query) {
-  const key = query.toLowerCase().replace(/[«»"]/g, "").trim();
+function scoreTitle(title, query) {
+  const t = title.toLowerCase();
+  const q = query.toLowerCase();
 
-  if (BOOK_MAP[key]) return BOOK_MAP[key];
+  let score = 0;
+  if (t.includes(q)) score += 100;
+  if (t.includes("(")) score += 20;
+  if (t.includes("/")) score += 10;
+  if (t.includes("автор")) score -= 30;
+  if (t.includes("обсуждение")) score -= 50;
+  if (t.includes("категория")) score -= 50;
 
-  const url =
-    "https://ru.wikisource.org/w/api.php?action=opensearch&format=json&limit=10&search=" +
-    encodeURIComponent(query);
-
-  const data = await fetch(url).then((r) => r.json());
-  return data?.[1]?.[0] || null;
+  return score;
 }
 
 async function findBook(query) {
-  const title = await findWikisourceTitle(query);
-  if (!title) return null;
+  const titles = await wikiSearch(query);
 
-  const main = await getWikisourcePage(title);
-  if (!main) return null;
+  if (!titles.length) return null;
 
-  let text = cleanText(main.html);
+  const sorted = titles.sort((a, b) => scoreTitle(b, query) - scoreTitle(a, query));
 
-  if (text.length > 5000) {
-    return { title: main.title, text };
-  }
+  for (const title of sorted.slice(0, 5)) {
+    const page = await getWikiPage(title);
+    if (!page) continue;
 
-  const childTitles = main.links
-    .map((l) => l["*"])
-    .filter((x) => x && x.startsWith(main.title + "/"))
-    .slice(0, 30);
-
-  let fullText = "";
-
-  for (const childTitle of childTitles) {
-    const child = await getWikisourcePage(childTitle);
-    if (!child) continue;
-
-    const childText = cleanText(child.html);
-
-    if (childText.length > 500) {
-      fullText += "\n\n" + childText;
+    if (page.text.length > 5000) {
+      return { title: page.title, text: page.text };
     }
 
-    if (fullText.length > 40000) break;
+    const childLinks = page.links
+      .map((l) => l["*"])
+      .filter((x) => x && x.startsWith(page.title + "/"))
+      .filter((x) => !x.includes("Обсуждение"))
+      .slice(0, 40);
+
+    let full = "";
+
+    for (const childTitle of childLinks) {
+      const child = await getWikiPage(childTitle);
+      if (!child || child.text.length < 500) continue;
+
+      full += "\n\n" + child.text;
+
+      if (full.length > 60000) break;
+    }
+
+    if (full.length > 3000) {
+      return { title: page.title, text: full };
+    }
   }
 
-  if (fullText.length < 1000) return null;
-
-  return {
-    title: main.title,
-    text: fullText,
-  };
+  return null;
 }
 
 async function readBook(chatId, book) {
-  const parts = splitText(book.text);
-
+  const parts = splitText(book.text, 900);
   sessions.set(chatId, { active: true });
 
-  await sendText(chatId, `Нашёл: ${book.title}\nНачинаю читать потоком.\nОстановить: /stop`);
+  await sendText(chatId, `Нашёл: ${book.title}\nНачинаю читать.\nОстановить: /stop`);
 
   for (let i = 0; i < parts.length; i++) {
     const session = sessions.get(chatId);
@@ -180,7 +207,7 @@ async function readBook(chatId, book) {
     const audio = await makeVoice(parts[i]);
     await sendAudio(chatId, audio, `part_${i + 1}.mp3`);
 
-    await new Promise((r) => setTimeout(r, 1000));
+    await new Promise((r) => setTimeout(r, 1200));
   }
 
   sessions.delete(chatId);
@@ -202,13 +229,14 @@ app.post("/", async (req, res) => {
     const text = message.text.trim();
 
     if (text === "/start") {
-      await sendText(chatId, "Напиши название книги.");
+      await sendText(chatId, "Напиши название книги. Я найду текст и начну читать.");
       return;
     }
 
     if (text === "/stop") {
       const session = sessions.get(chatId);
       if (session) session.active = false;
+      await sendText(chatId, "Останавливаю чтение.");
       return;
     }
 
@@ -217,12 +245,12 @@ app.post("/", async (req, res) => {
       return;
     }
 
-    await sendText(chatId, "Ищу книгу в интернете...");
+    await sendText(chatId, "Ищу книгу...");
 
     const book = await findBook(text);
 
     if (!book) {
-      await sendText(chatId, "Не нашёл текст. Попробуй: Преступление и наказание, Капитанская дочка, Шинель.");
+      await sendText(chatId, "Не нашёл книгу. Попробуй точнее: автор + название.");
       return;
     }
 

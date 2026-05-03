@@ -1,6 +1,6 @@
 const express = require("express");
 const fetch = require("node-fetch");
-const FormData = require("form-data");
+const googleTTS = require("google-tts-api");
 
 const app = express();
 app.use(express.json());
@@ -11,8 +11,6 @@ app.get("/", (req, res) => {
 
 app.post("/", async (req, res) => {
   try {
-    console.log("UPDATE:", req.body);
-
     const message = req.body.message;
 
     if (!message || !message.text) {
@@ -20,7 +18,7 @@ app.post("/", async (req, res) => {
     }
 
     const chatId = message.chat.id;
-    const text = message.text;
+    const text = message.text.slice(0, 200);
 
     await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
       method: "POST",
@@ -31,62 +29,26 @@ app.post("/", async (req, res) => {
       })
     });
 
-  
-     const gTTS = require("gtts");
-const fs = require("fs");
-
-const gtts = new gTTS(text, "ru");
-const filePath = "./voice.mp3";
-
-gtts.save(filePath, async function (err) {
-  if (err) {
-    console.log(err);
-    return;
-  }
-
-  const formData = new FormData();
-  formData.append("chat_id", chatId);
-  formData.append("audio", fs.createReadStream(filePath));
-
-  await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendAudio`, {
-    method: "POST",
-    body: formData,
-  });
-});
-
-   
-
-      await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-        
-        })
-      });
-
-      return res.sendStatus(200);
-    }
-
-  
-
-    const formData = new FormData();
-    formData.append("chat_id", String(chatId));
-    formData.append("audio", audioBuffer, {
-      filename: "reading.mp3",
-      contentType: "audio/mpeg"
+    const audioUrl = googleTTS.getAudioUrl(text, {
+      lang: "ru",
+      slow: false,
+      host: "https://translate.google.com"
     });
 
     await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendAudio`, {
       method: "POST",
-      headers: formData.getHeaders(),
-      body: formData
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        audio: audioUrl,
+        title: "Озвучка",
+        performer: "Book Voice AI"
+      })
     });
 
     res.sendStatus(200);
   } catch (error) {
     console.log("SERVER ERROR:", error);
-
     res.sendStatus(200);
   }
 });

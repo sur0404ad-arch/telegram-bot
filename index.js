@@ -31,42 +31,44 @@ app.post("/", async (req, res) => {
       })
     });
 
-    const elevenResponse = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVEN_VOICE_ID}`,
-      {
-        method: "POST",
-        headers: {
-          "xi-api-key": process.env.ELEVEN_API_KEY,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          text: text,
-          model_id: "eleven_multilingual_v2",
-          voice_settings: {
-            stability: 0.55,
-            similarity_boost: 0.75
-          }
-        })
-      }
-    );
+  
+     const gTTS = require("gtts");
+const fs = require("fs");
 
-    if (!elevenResponse.ok) {
-      const errorText = await elevenResponse.text();
-      console.log("ElevenLabs error:", errorText);
+const gtts = new gTTS(text, "ru");
+const filePath = "./voice.mp3";
+
+gtts.save(filePath, async function (err) {
+  if (err) {
+    console.log(err);
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append("chat_id", chatId);
+  formData.append("audio", fs.createReadStream(filePath));
+
+  await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendAudio`, {
+    method: "POST",
+    body: formData,
+  });
+});
+
+   
 
       await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: chatId,
-          text: "Ошибка ElevenLabs: " + errorText
+        
         })
       });
 
       return res.sendStatus(200);
     }
 
-    const audioBuffer = await elevenResponse.buffer();
+  
 
     const formData = new FormData();
     formData.append("chat_id", String(chatId));

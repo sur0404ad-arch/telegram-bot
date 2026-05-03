@@ -1,24 +1,38 @@
 const express = require("express");
 const fetch = require("node-fetch");
+const FormData = require("form-data");
+
 const app = express();
 app.use(express.json());
 
 const TOKEN = process.env.BOT_TOKEN;
+const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
+const VOICE_ID = process.env.ELEVEN_VOICE_ID;
 
-async function sendMessage(chatId, text) {
-  await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+async function sendVoice(chatId, text) {
+  const tts = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "xi-api-key": ELEVEN_API_KEY,
+      "Content-Type": "application/json",
+    },
     body: JSON.stringify({
-      chat_id: chatId,
       text: text,
+      model_id: "eleven_multilingual_v2",
     }),
   });
-}
 
-app.get("/", (req, res) => {
-  res.send("Book reader bot is running");
-});
+  const audioBuffer = await tts.buffer();
+
+  const form = new FormData();
+  form.append("chat_id", chatId);
+  form.append("voice", audioBuffer, { filename: "voice.ogg" });
+
+  await fetch(`https://api.telegram.org/bot${TOKEN}/sendVoice`, {
+    method: "POST",
+    body: form,
+  });
+}
 
 app.post("/", async (req, res) => {
   try {
@@ -29,29 +43,23 @@ app.post("/", async (req, res) => {
     }
 
     const chatId = message.chat.id;
-    const text = message.text.trim();
+    const text = message.text;
 
     if (text === "/start") {
-      await sendMessage(
-        chatId,
-        "Напиши название художественного произведения, которое хочешь слушать. Например: Преступление и наказание"
-      );
+      await sendVoice(chatId, "Назови произведение, и я начну читать");
     } else {
-      await sendMessage(
-        chatId,
-        `Ищу произведение: "${text}"\n\nСледующий шаг — подключим поиск книги в интернете и чтение вслух.`
-      );
+      await sendVoice(chatId, `Начинаю читать: ${text}`);
     }
 
     res.sendStatus(200);
   } catch (error) {
-    console.log("SERVER ERROR:", error);
+    console.log(error);
     res.sendStatus(200);
   }
 });
 
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log("Server started on port", PORT);
+app.get("/", (req, res) => {
+  res.send("Voice bot running");
 });
+
+app.listen(process.env.PORT || 3000);

@@ -120,7 +120,7 @@ app.post("/", async (req, res) => {
       })
     });
 
-    const chunks = splitText(book.text, 180).slice(0, 3);
+   const chunks = splitText(book.text, 900).slice(0, 10);
 
     for (const chunk of chunks) {
       const audioUrl = googleTTS.getAudioUrl(chunk, {

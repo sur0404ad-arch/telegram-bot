@@ -1,4 +1,4 @@
-console.log("FINAL FAST READER VERSION STARTED");
+console.log("FINAL VOICE VERSION STARTED");
 
 const express = require("express");
 const fetch = require("node-fetch");
@@ -37,11 +37,13 @@ async function sendAction(chatId) {
 
 async function sendAudio(chatId, buffer, filename, caption = "") {
   const form = new FormData();
+
   form.append("chat_id", chatId);
   form.append("audio", buffer, {
     filename,
     contentType: "audio/mpeg",
   });
+
   if (caption) form.append("caption", caption);
 
   const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendAudio`, {
@@ -78,20 +80,35 @@ function cleanVoiceText(text) {
     .trim();
 }
 
+function addNarrationStyle(text) {
+  return `Он говорил спокойно. Тихо. С небольшими паузами.\n\n${text}`;
+}
+
 function splitParts(text) {
   const clean = cleanVoiceText(text);
   const parts = [];
 
-  let first = clean.slice(0, 550);
-  let cut = Math.max(first.lastIndexOf("."), first.lastIndexOf("!"), first.lastIndexOf("?"));
+  let first = clean.slice(0, 650);
+  let cut = Math.max(
+    first.lastIndexOf("."),
+    first.lastIndexOf("!"),
+    first.lastIndexOf("?")
+  );
+
   if (cut > 180) first = first.slice(0, cut + 1);
   parts.push(first.trim());
 
   let rest = clean.slice(first.length).trim();
 
   while (rest.length > 0 && parts.length < 12) {
-    let part = rest.slice(0, 2200);
-    cut = Math.max(part.lastIndexOf("."), part.lastIndexOf("!"), part.lastIndexOf("?"));
+    let part = rest.slice(0, 2400);
+
+    cut = Math.max(
+      part.lastIndexOf("."),
+      part.lastIndexOf("!"),
+      part.lastIndexOf("?")
+    );
+
     if (cut > 900) part = part.slice(0, cut + 1);
 
     parts.push(part.trim());
@@ -102,6 +119,8 @@ function splitParts(text) {
 }
 
 async function makeVoice(text) {
+  const finalText = addNarrationStyle(cleanVoiceText(text));
+
   const res = await Promise.race([
     fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`, {
       method: "POST",
@@ -111,12 +130,12 @@ async function makeVoice(text) {
         Accept: "audio/mpeg",
       },
       body: JSON.stringify({
-        text: cleanVoiceText(text),
-        model_id: "eleven_turbo_v2_5",
+        text: finalText,
+        model_id: "eleven_multilingual_v2",
         voice_settings: {
-          stability: 0.5,
-          similarity_boost: 0.9,
-          style: 0.25,
+          stability: 0.6,
+          similarity_boost: 0.78,
+          style: 0.42,
           use_speaker_boost: true,
         },
       }),
@@ -130,6 +149,7 @@ async function makeVoice(text) {
 
 function badTitle(title) {
   const t = title.toLowerCase();
+
   return (
     t.includes("эпилог") ||
     t.includes("обсуждение") ||
@@ -205,13 +225,20 @@ async function findBookStart(query) {
 
     for (const childTitle of childTitles) {
       const child = await getWikiPage(childTitle);
+
       if (child && child.text.length > 1200 && !badTitle(child.title)) {
-        return { title: child.title, text: child.text };
+        return {
+          title: child.title,
+          text: child.text,
+        };
       }
     }
 
     if (page.text.length > 2500 && !badTitle(page.title)) {
-      return { title: page.title, text: page.text };
+      return {
+        title: page.title,
+        text: page.text,
+      };
     }
   }
 
@@ -222,13 +249,17 @@ async function keepAlive(chatId) {
   const id = setInterval(() => {
     sendAction(chatId).catch(() => {});
   }, 4000);
+
   return () => clearInterval(id);
 }
 
 async function readBook(chatId, query) {
   sessions.set(chatId, { active: true });
 
-  await sendText(chatId, "Принял. Ищу начало книги. Сначала отправлю короткий голос, потом пойдут части.");
+  await sendText(
+    chatId,
+    "📖 Принял. Ищу начало книги. Сначала отправлю короткий голос, потом пойдут части."
+  );
 
   const stopAlive = await keepAlive(chatId);
 
@@ -236,6 +267,7 @@ async function readBook(chatId, query) {
     const introAudio = await makeVoice(
       `Начинаю подготовку книги: ${query}. Сейчас найду начало текста и отправлю первую часть.`
     );
+
     await sendAudio(chatId, introAudio, "intro.mp3", "Начинаю");
   } catch (e) {
     console.log("INTRO ERROR:", e.message);
@@ -246,16 +278,21 @@ async function readBook(chatId, query) {
   if (!book) {
     stopAlive();
     sessions.delete(chatId);
+
     await sendText(chatId, "Не нашёл текст. Попробуй точнее: название плюс автор.");
     return;
   }
 
   const parts = splitParts(book.text);
 
-  await sendText(chatId, `Нашёл: ${book.title}\nОтправляю чтение. Остановить: /stop`);
+  await sendText(
+    chatId,
+    `Нашёл: ${book.title}\n\nОтправляю чтение.\nОстановить: /stop`
+  );
 
   for (let i = 0; i < parts.length; i++) {
     const session = sessions.get(chatId);
+
     if (!session || !session.active) {
       stopAlive();
       await sendText(chatId, "Чтение остановлено.");
@@ -263,16 +300,18 @@ async function readBook(chatId, query) {
     }
 
     const audio = await makeVoice(parts[i]);
+
     await sendAudio(chatId, audio, `part_${i + 1}.mp3`, `Часть ${i + 1}`);
   }
 
   stopAlive();
   sessions.delete(chatId);
+
   await sendText(chatId, "Глава закончилась.");
 }
 
 app.get("/", (req, res) => {
-  res.send("Final fast reader is running");
+  res.send("Final voice reader is running");
 });
 
 app.post("/", async (req, res) => {
@@ -286,13 +325,17 @@ app.post("/", async (req, res) => {
     const text = message.text.trim();
 
     if (text === "/start") {
-      await sendText(chatId, "Напиши название книги и автора. Например: Преступление и наказание Достоевский");
+      await sendText(
+        chatId,
+        "Напиши название книги и автора. Например: Преступление и наказание Достоевский"
+      );
       return;
     }
 
     if (text === "/stop") {
       const session = sessions.get(chatId);
       if (session) session.active = false;
+
       await sendText(chatId, "Останавливаю чтение.");
       return;
     }
@@ -305,6 +348,7 @@ app.post("/", async (req, res) => {
     readBook(chatId, text).catch(async (err) => {
       console.log("READ ERROR:", err.message);
       sessions.delete(chatId);
+
       await sendText(chatId, "Ошибка чтения:\n" + err.message);
     });
   } catch (err) {
@@ -313,4 +357,7 @@ app.post("/", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("FINAL FAST READER VERSION STARTED"));
+
+app.listen(PORT, () => {
+  console.log("FINAL VOICE VERSION STARTED");
+});

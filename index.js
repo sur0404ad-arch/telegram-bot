@@ -26,9 +26,9 @@ async function sendVoice(chatId, text) {
 
   const form = new FormData();
   form.append("chat_id", chatId);
-  form.append("voice", audioBuffer, { filename: "voice.ogg" });
+form.append("audio", audioBuffer, { filename: "voice.mp3" });
 
-  await fetch(`https://api.telegram.org/bot${TOKEN}/sendVoice`, {
+await fetch(`https://api.telegram.org/bot${TOKEN}/sendAudio`, {
     method: "POST",
     body: form,
   });

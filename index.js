@@ -20,8 +20,8 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-const jobs = {};
 const controllers = {};
+const jobs = {};
 
 app.get("/", (req, res) => res.send("SERVER RUNNING"));
 
@@ -42,45 +42,29 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     }
 
     if (text === "/stop") {
-      stopJob(chatId);
-      await saveSession(chatId, { stopped: true });
+      await stopJob(chatId);
       return sendMessage(chatId, "⏹ Остановлено. Позиция сохранена.");
     }
 
     if (text === "/resume") {
-      const session = await getSession(chatId);
-      if (!session?.book_key) return sendMessage(chatId, "❌ Нет сохранённой книги.");
-
-      const jobId = newJob(chatId);
-      await saveSession(chatId, { stopped: false, job_id: jobId });
-      return autoplay(chatId, jobId);
+      return resumeBook(chatId);
     }
 
-    if (isBlocked(text)) {
-      return sendMessage(chatId, "❌ Книга защищена авторским правом.");
+    if (text === "/next") {
+      return sendCurrentPart(chatId);
     }
 
-    stopJob(chatId);
-
-    const jobId = newJob(chatId);
-
-    await saveSession(chatId, {
-      query: text,
-      book_key: null,
-      title: null,
-      part_index: 0,
-      stopped: false,
-      job_id: jobId
-    });
+    await stopJob(chatId);
 
     await sendMessage(chatId, "🔎 Ищу и готовлю книгу...");
 
     const book = await getOrCreateBook(text);
-    if (!isAlive(chatId, jobId)) return;
 
-    if (!book || !book.parts.length) {
-      return sendMessage(chatId, "❌ Не удалось подготовить книгу.");
+    if (!book) {
+      return sendMessage(chatId, "❌ Сейчас стабильно подключена только книга: Преступление и наказание.");
     }
+
+    const jobId = newJob(chatId);
 
     await saveSession(chatId, {
       query: text,
@@ -93,10 +77,10 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
 
     await sendMessage(
       chatId,
-      `📖 Нашёл:\n${book.title}\n\n🎬 Запускаю как аудиосериал.\nЧастей: ${book.parts.length}\n\n/stop — остановить\n/resume — продолжить`
+      `📖 ${book.title}\n\n🎬 Режим Netflix:\n/next — следующая часть\n/stop — остановить\n/resume — продолжить\n\nЧастей: ${book.parts.length}`
     );
 
-    return autoplay(chatId, jobId);
+    return sendCurrentPart(chatId);
 
   } catch (e) {
     console.log("SERVER ERROR:", e.response?.data || e.message || e);
@@ -107,9 +91,7 @@ async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS books (
       key TEXT PRIMARY KEY,
-      query TEXT,
-      title TEXT,
-      source TEXT,
+      title TEXT NOT NULL,
       parts JSONB NOT NULL,
       created_at TIMESTAMP DEFAULT NOW()
     );
@@ -139,173 +121,74 @@ async function initDB() {
   `);
 }
 
-function newJob(chatId) {
-  const jobId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-  jobs[chatId] = jobId;
-  return jobId;
-}
-
-function stopJob(chatId) {
-  jobs[chatId] = `stopped_${Date.now()}`;
-
-  if (controllers[chatId]) {
-    try {
-      controllers[chatId].abort();
-    } catch {}
-    delete controllers[chatId];
-  }
-}
-
-function isAlive(chatId, jobId) {
-  return jobs[chatId] === jobId;
-}
-
-async function autoplay(chatId, jobId) {
-  const session = await getSession(chatId);
-  if (!session?.book_key || !isAlive(chatId, jobId)) return;
-
-  const book = await getBookByKey(session.book_key);
-  if (!book) return sendMessage(chatId, "❌ Книга не найдена в базе.");
-
-  let index = Number(session.part_index || 0);
-
-  while (index < book.parts.length) {
-    if (!isAlive(chatId, jobId)) return;
-
-    await sendMessage(chatId, `🎙 Часть ${index + 1}/${book.parts.length}`);
-
-    let audio = await getCachedAudio(book.key, index);
-
-    if (!audio) {
-      const controller = new AbortController();
-      controllers[chatId] = controller;
-
-      try {
-        audio = await elevenLabsTTS(book.parts[index], controller.signal);
-        await saveAudioCache(book.key, index, audio);
-      } catch (e) {
-        if (e.name === "CanceledError" || e.code === "ERR_CANCELED") return;
-        throw e;
-      } finally {
-        delete controllers[chatId];
-      }
-    }
-
-    if (!isAlive(chatId, jobId)) return;
-
-   if (!isAlive(chatId, jobId)) return;
-    await sendAudio(
-      chatId,
-      audio,
-      `part_${index + 1}.mp3`,
-      `📖 ${book.title}\nЧасть ${index + 1}/${book.parts.length}`
-    );
-
-    index++;
-
-    await saveSession(chatId, {
-      part_index: index,
-      stopped: false,
-      job_id: jobId
-    });
-
-    await sleep(500);
-  }
-
-  if (isAlive(chatId, jobId)) {
-    await sendMessage(chatId, "✅ Книга закончена.");
-  }
-}
-
 async function getOrCreateBook(query) {
-  const detected = detectKnownRussianBook(query);
-  const key = detected ? detected.key : hash(query.toLowerCase().trim());
+  const detected = detectBook(query);
+  if (!detected) return null;
 
-  const cached = await getBookByKey(key);
-  if (cached) {
-    console.log("BOOK CACHE HIT:", cached.title);
-    return cached;
-  }
+  const cached = await getBookByKey(detected.key);
+  if (cached) return cached;
 
-  console.log("BOOK CACHE MISS:", query);
+  const text = await loadCrimeAndPunishment();
+  if (!text || text.length < 5000) return null;
 
-  let book = null;
-
-  if (detected?.source === "ilibrary") {
-    book = await loadFromILibrary(detected);
-  }
-
-  if (!book || !book.text || book.text.length < 1000) {
-    book = await loadFromGutenberg(normalizeForGutenberg(query));
-  }
-
-  if (!book || !book.text || book.text.length < 1000) return null;
-
-  const parts = splitText(book.text, 1700)
-    .filter(p => p.length > 250)
-    .slice(0, 160);
+  const parts = splitText(text, 5000).filter(p => p.length > 1000);
 
   await pool.query(
-    `INSERT INTO books (key, query, title, source, parts)
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (key)
-     DO UPDATE SET title=$3, source=$4, parts=$5`,
-    [key, query, book.title, book.source, JSON.stringify(parts)]
+    `INSERT INTO books (key, title, parts)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (key) DO UPDATE SET title=$2, parts=$3`,
+    [detected.key, detected.title, JSON.stringify(parts)]
   );
 
-  return { key, title: book.title, source: book.source, parts };
+  return {
+    key: detected.key,
+    title: detected.title,
+    parts
+  };
 }
 
-function detectKnownRussianBook(query) {
+function detectBook(query) {
   const t = query.toLowerCase();
 
-  if (t.includes("преступление")) {
+  if (t.includes("преступление") || t.includes("достоевский")) {
     return {
       key: "ru_crime_and_punishment",
-      title: "Преступление и наказание",
-      source: "ilibrary",
-      baseUrl: "https://ilibrary.ru/text/69/p.",
-      maxPages: 90
+      title: "Преступление и наказание"
     };
   }
 
   return null;
 }
 
-async function loadFromILibrary(book) {
+async function loadCrimeAndPunishment() {
   let full = "";
 
-  for (let i = 1; i <= book.maxPages; i++) {
-    try {
-      const url = `${book.baseUrl}${i}/index.html`;
+  for (let i = 1; i <= 90; i++) {
+    const url = `https://ilibrary.ru/text/69/p.${i}/index.html`;
 
+    try {
       const res = await axios.get(url, {
         timeout: 15000,
         responseType: "text",
         headers: { "User-Agent": "BookVoiceAI/1.0" }
       });
 
-      const text = cleanILibraryText(res.data);
+      const clean = cleanILibrary(res.data);
 
-      if (text.length > 300) {
-        full += "\n\n" + text;
+      if (clean.length > 500) {
+        full += "\n\n" + clean;
       }
 
-      if (full.length > 220000) break;
-
-    } catch (e) {
+      if (full.length > 250000) break;
+    } catch {
       break;
     }
   }
 
-  return {
-    title: book.title,
-    source: "ilibrary",
-    text: full.trim()
-  };
+  return full.trim();
 }
 
-function cleanILibraryText(html) {
+function cleanILibrary(html) {
   let text = String(html || "");
 
   text = text
@@ -322,88 +205,127 @@ function cleanILibraryText(html) {
     .replace(/\s+/g, " ")
     .trim();
 
-  text = text.replace(/^[\s\S]*?Преступление и наказание/i, "Преступление и наказание");
+  text = text
+    .replace(/^[\s\S]*?Федор Достоевский/i, "Федор Достоевский")
+    .replace(/Читать онлайн[\s\S]*?читать/i, "")
+    .replace(/Все права защищены[\s\S]*$/i, "")
+    .trim();
 
   return text;
 }
 
-async function loadFromGutenberg(query) {
-  const res = await axios.get("https://gutendex.com/books/", {
-    params: { search: query },
-    timeout: 15000,
-    headers: { "User-Agent": "BookVoiceAI/1.0" }
-  });
+async function sendCurrentPart(chatId) {
+  const session = await getSession(chatId);
 
-  const books = res.data.results || [];
-  const book = books.find(b => b.copyright !== true);
-  if (!book) return null;
-
-  const url =
-    book.formats["text/plain; charset=utf-8"] ||
-    book.formats["text/plain; charset=us-ascii"] ||
-    book.formats["text/plain"];
-
-  if (!url) return null;
-
-  const txt = await axios.get(url, {
-    timeout: 25000,
-    responseType: "text",
-    headers: { "User-Agent": "BookVoiceAI/1.0" }
-  });
-
-  return {
-    title: translateTitle(book.title),
-    source: "gutenberg",
-    text: cleanGutenbergText(txt.data)
-  };
-}
-
-function normalizeForGutenberg(text) {
-  const t = text.toLowerCase();
-
-  const map = [
-    ["преступление", "Crime and Punishment"],
-    ["анна каренина", "Anna Karenina"],
-    ["война и мир", "War and Peace"],
-    ["идиот", "The Idiot"],
-    ["братья карамазовы", "The Brothers Karamazov"],
-    ["отцы и дети", "Fathers and Sons"],
-    ["евгений онегин", "Eugene Onegin"],
-    ["мертвые души", "Dead Souls"]
-  ];
-
-  for (const [ru, en] of map) {
-    if (t.includes(ru)) return en;
+  if (!session?.book_key) {
+    return sendMessage(chatId, "❌ Нет активной книги.");
   }
 
-  return text;
+  if (session.stopped) {
+    return sendMessage(chatId, "⏸ Остановлено. Напиши /resume.");
+  }
+
+  const book = await getBookByKey(session.book_key);
+  if (!book) return sendMessage(chatId, "❌ Книга не найдена в базе.");
+
+  const index = Number(session.part_index || 0);
+
+  if (index >= book.parts.length) {
+    return sendMessage(chatId, "✅ Книга закончена.");
+  }
+
+  const jobId = newJob(chatId);
+
+  await saveSession(chatId, {
+    stopped: false,
+    job_id: jobId
+  });
+
+  await sendMessage(chatId, `🎙 Часть ${index + 1}/${book.parts.length}`);
+
+  let audio = await getCachedAudio(book.key, index);
+
+  if (!audio) {
+    const controller = new AbortController();
+    controllers[chatId] = controller;
+
+    try {
+      audio = await elevenLabsTTS(book.parts[index], controller.signal);
+      if (!(await isAlive(chatId, jobId))) return;
+      await saveAudioCache(book.key, index, audio);
+    } catch (e) {
+      if (e.name === "CanceledError" || e.code === "ERR_CANCELED") return;
+      console.log("TTS ERROR:", e.response?.data || e.message);
+      return sendMessage(chatId, "❌ Ошибка озвучки.");
+    } finally {
+      delete controllers[chatId];
+    }
+  }
+
+  if (!(await isAlive(chatId, jobId))) return;
+
+  await sendAudio(
+    chatId,
+    audio,
+    `part_${index + 1}.mp3`,
+    `📖 ${book.title}\nЧасть ${index + 1}/${book.parts.length}`
+  );
+
+  if (!(await isAlive(chatId, jobId))) return;
+
+  await saveSession(chatId, {
+    part_index: index + 1,
+    stopped: false,
+    job_id: jobId
+  });
+
+  await sendMessage(chatId, "▶️ Напиши /next для следующей части или /stop для остановки.");
 }
 
-function translateTitle(title) {
-  const map = {
-    "Crime and Punishment": "Преступление и наказание",
-    "Anna Karenina": "Анна Каренина",
-    "War and Peace": "Война и мир",
-    "The Idiot": "Идиот",
-    "The Brothers Karamazov": "Братья Карамазовы"
-  };
+async function resumeBook(chatId) {
+  const session = await getSession(chatId);
 
-  return map[title] || title;
+  if (!session?.book_key) {
+    return sendMessage(chatId, "❌ Нет сохранённой книги.");
+  }
+
+  await saveSession(chatId, {
+    stopped: false,
+    job_id: newJob(chatId)
+  });
+
+  return sendCurrentPart(chatId);
 }
 
-function cleanGutenbergText(text) {
-  let t = String(text || "");
+async function stopJob(chatId) {
+  jobs[chatId] = `stopped_${Date.now()}`;
 
-  t = t.replace(/[\s\S]*?\*\*\* START OF (THIS|THE) PROJECT GUTENBERG EBOOK[\s\S]*?\*\*\*/i, "");
-  t = t.replace(/\*\*\* END OF (THIS|THE) PROJECT GUTENBERG EBOOK[\s\S]*/i, "");
+  if (controllers[chatId]) {
+    try {
+      controllers[chatId].abort();
+    } catch {}
+    delete controllers[chatId];
+  }
 
-  return t
-    .replace(/\r/g, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .replace(/[ \t]{2,}/g, " ")
-    .replace(/_/g, "")
-    .trim()
-    .slice(0, 220000);
+  const session = await getSession(chatId);
+
+  if (session) {
+    await saveSession(chatId, {
+      stopped: true,
+      job_id: jobs[chatId]
+    });
+  }
+}
+
+function newJob(chatId) {
+  const jobId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  jobs[chatId] = jobId;
+  return jobId;
+}
+
+async function isAlive(chatId, jobId) {
+  const session = await getSession(chatId);
+  return jobs[chatId] === jobId && session && !session.stopped && session.job_id === jobId;
 }
 
 function splitText(text, maxLength) {
@@ -423,6 +345,7 @@ function splitText(text, maxLength) {
   }
 
   if (current.trim()) parts.push(current.trim());
+
   return parts;
 }
 
@@ -433,9 +356,9 @@ async function elevenLabsTTS(text, signal) {
       text,
       model_id: "eleven_multilingual_v2",
       voice_settings: {
-        stability: 0.45,
+        stability: 0.5,
         similarity_boost: 0.8,
-        style: 0.35,
+        style: 0.25,
         use_speaker_boost: true
       }
     },
@@ -446,7 +369,7 @@ async function elevenLabsTTS(text, signal) {
         Accept: "audio/mpeg"
       },
       responseType: "arraybuffer",
-      timeout: 60000,
+      timeout: 90000,
       signal
     }
   );
@@ -459,7 +382,7 @@ async function sendMessage(chatId, text) {
     chat_id: chatId,
     text,
     reply_markup: {
-      keyboard: [["/stop", "/resume"]],
+      keyboard: [["/next"], ["/stop", "/resume"]],
       resize_keyboard: true
     }
   });
@@ -479,7 +402,7 @@ async function sendAudio(chatId, audioBuffer, filename, caption) {
     headers: form.getHeaders(),
     maxContentLength: Infinity,
     maxBodyLength: Infinity,
-    timeout: 60000
+    timeout: 90000
   });
 }
 
@@ -492,28 +415,8 @@ async function getBookByKey(key) {
   return {
     key: row.key,
     title: row.title,
-    source: row.source,
     parts: row.parts
   };
-}
-
-async function getCachedAudio(bookKey, partIndex) {
-  const r = await pool.query(
-    "SELECT audio FROM audio_cache WHERE book_key=$1 AND part_index=$2",
-    [bookKey, partIndex]
-  );
-
-  if (!r.rows.length) return null;
-  return r.rows[0].audio;
-}
-
-async function saveAudioCache(bookKey, partIndex, audio) {
-  await pool.query(
-    `INSERT INTO audio_cache (book_key, part_index, audio)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (book_key, part_index) DO NOTHING`,
-    [bookKey, partIndex, audio]
-  );
 }
 
 async function getSession(chatId) {
@@ -542,29 +445,27 @@ async function saveSession(chatId, data) {
   );
 }
 
+async function getCachedAudio(bookKey, partIndex) {
+  const r = await pool.query(
+    "SELECT audio FROM audio_cache WHERE book_key=$1 AND part_index=$2",
+    [bookKey, partIndex]
+  );
+
+  if (!r.rows.length) return null;
+  return r.rows[0].audio;
+}
+
+async function saveAudioCache(bookKey, partIndex, audio) {
+  await pool.query(
+    `INSERT INTO audio_cache (book_key, part_index, audio)
+     VALUES ($1,$2,$3)
+     ON CONFLICT (book_key, part_index) DO NOTHING`,
+    [bookKey, partIndex, audio]
+  );
+}
+
 function hash(text) {
   return crypto.createHash("sha256").update(text).digest("hex");
-}
-
-function isBlocked(text) {
-  const t = text.toLowerCase();
-
-  return [
-    "гарри поттер",
-    "harry potter",
-    "rowling",
-    "роулинг",
-    "стивен кинг",
-    "stephen king",
-    "метро 2033",
-    "пелевин",
-    "акунин",
-    "лукьяненко"
-  ].some(x => t.includes(x));
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 initDB()

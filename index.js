@@ -224,7 +224,7 @@ app.post("/", async (req, res) => {
 
     await sendText(chatId, "Ищу книгу в интернете...");
 
-    const book = await searchWikisource(text);
+    const book = await searchBook(text);
 
     if (!book || !book.text || book.text.length < 1000) {
       await sendText(

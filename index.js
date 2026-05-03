@@ -1,83 +1,174 @@
-console.log("BOOK BOT CLEAN VOICE VERSION STARTED");
-
 const express = require("express");
-const fetch = require("node-fetch");
+const axios = require("axios");
 const FormData = require("form-data");
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "20mb" }));
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
-const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
+const PORT = process.env.PORT || 3000;
 
-const sessions = new Map();
+if (!BOT_TOKEN) console.log("❌ BOT_TOKEN missing");
+if (!ELEVENLABS_API_KEY) console.log("❌ ELEVENLABS_API_KEY missing");
+if (!ELEVENLABS_VOICE_ID) console.log("❌ ELEVENLABS_VOICE_ID missing");
 
-function timeout(ms) {
-  return new Promise((_, reject) => {
-    setTimeout(() => reject(new Error("TIMEOUT")), ms);
-  });
-}
+const TG_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
-async function sendText(chatId, text) {
-  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text })
-  });
-}
+app.get("/", (req, res) => {
+  res.send("SERVER RUNNING");
+});
 
-async function sendAction(chatId) {
-  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, action: "upload_audio" })
-  });
-}
+app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
+  res.sendStatus(200);
 
-async function sendAudio(chatId, buffer, filename, caption) {
-  const form = new FormData();
+  try {
+    const msg = req.body.message;
+    if (!msg || !msg.chat || !msg.text) return;
 
-  form.append("chat_id", chatId);
-  form.append("audio", buffer, {
-    filename,
-    contentType: "audio/mpeg"
-  });
+    const chatId = msg.chat.id;
+    const userText = msg.text.trim();
 
-  if (caption) form.append("caption", caption);
+    console.log("USER MESSAGE:", userText);
 
-  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendAudio`, {
-    method: "POST",
-    headers: form.getHeaders(),
-    body: form
-  });
+    if (userText === "/start") {
+      await sendMessage(
+        chatId,
+        "📚 Напиши название книги и автора.\n\nНапример:\nПреступление и наказание Достоевский"
+      );
+      return;
+    }
 
-  if (!res.ok) {
-    throw new Error(await res.text());
+    await sendMessage(chatId, "📖 Проверяю доступность книги (авторские права)...");
+
+    const book = await findPublicDomainBook(userText);
+
+    if (!book) {
+      await sendMessage(
+        chatId,
+        "❌ Книга не найдена в public domain.\n\nВозможно, она защищена авторским правом."
+      );
+      return;
+    }
+
+    if (book.copyright === true) {
+      await sendMessage(chatId, "❌ Книга защищена авторским правом.");
+      return;
+    }
+
+    await sendMessage(chatId, `📖 Нашёл книгу:\n${book.title}\n\n🎧 Читаю...`);
+
+    const textUrl = getTextUrl(book);
+    if (!textUrl) {
+      await sendMessage(chatId, "❌ У этой книги нет текстового формата для чтения.");
+      return;
+    }
+
+    console.log("TEXT URL:", textUrl);
+
+    const rawText = await downloadBookText(textUrl);
+    const cleanText = cleanBookText(rawText);
+
+    if (!cleanText || cleanText.length < 500) {
+      await sendMessage(chatId, "❌ Не удалось получить нормальный текст книги.");
+      return;
+    }
+
+    const chunks = splitText(cleanText, 2200).slice(0, 3);
+
+    for (let i = 0; i < chunks.length; i++) {
+      console.log(`VOICE CHUNK ${i + 1}/${chunks.length}`);
+
+      const audioBuffer = await elevenLabsTTS(narrationText(chunks[i]));
+
+      await sendAudio(chatId, audioBuffer, `part_${i + 1}.mp3`, `Часть ${i + 1}`);
+    }
+
+    await sendMessage(chatId, "✅ Готово. Отправил первые части книги.");
+
+  } catch (error) {
+    console.log("SERVER ERROR:", error.response?.data || error.message || error);
   }
+});
+
+async function findPublicDomainBook(query) {
+  const url = `https://gutendex.com/books/?search=${encodeURIComponent(query)}`;
+  const response = await axios.get(url, { timeout: 20000 });
+
+  const books = response.data.results || [];
+
+  console.log("BOOKS FOUND:", books.length);
+
+  const publicBooks = books.filter((b) => b.copyright !== true);
+
+  return publicBooks[0] || null;
 }
 
-function cleanHtml(html) {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<sup[\s\S]*?<\/sup>/gi, "")
-    .replace(/<table[\s\S]*?<\/table>/gi, "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;|&#160;/g, " ")
-    .replace(/&quot;/g, "\"")
-    .replace(/&amp;/g, "&")
-    .replace(/\[[^\]]*\]/g, "")
-    .replace(/\s+/g, " ")
+function getTextUrl(book) {
+  const formats = book.formats || {};
+
+  return (
+    formats["text/plain; charset=utf-8"] ||
+    formats["text/plain; charset=us-ascii"] ||
+    formats["text/plain"] ||
+    null
+  );
+}
+
+async function downloadBookText(url) {
+  const response = await axios.get(url, {
+    timeout: 30000,
+    responseType: "text",
+  });
+
+  return response.data;
+}
+
+function cleanBookText(text) {
+  let t = String(text || "");
+
+  const startMarkers = [
+    "*** START OF THE PROJECT GUTENBERG EBOOK",
+    "*** START OF THIS PROJECT GUTENBERG EBOOK",
+    "*** START OF PROJECT GUTENBERG",
+  ];
+
+  const endMarkers = [
+    "*** END OF THE PROJECT GUTENBERG EBOOK",
+    "*** END OF THIS PROJECT GUTENBERG EBOOK",
+    "*** END OF PROJECT GUTENBERG",
+  ];
+
+  for (const marker of startMarkers) {
+    const index = t.indexOf(marker);
+    if (index !== -1) {
+      t = t.slice(index + marker.length);
+      break;
+    }
+  }
+
+  for (const marker of endMarkers) {
+    const index = t.indexOf(marker);
+    if (index !== -1) {
+      t = t.slice(0, index);
+      break;
+    }
+  }
+
+  return t
+    .replace(/\r/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
     .trim();
 }
 
 function cleanVoiceText(text) {
-  return text
-    .replace(/Материал из Викитеки|Викитека|Содержание|Править|править код/gi, "")
-    .replace(/Перейти к навигации|Перейти к поиску|Источник|См. также/gi, "")
-    .replace(/Эта страница в последний раз была отредактирована[\s\S]*/gi, "")
-    .replace(/[^\p{L}\p{N}\s.,!?;:—\-«»"()]/gu, "")
+  return String(text || "")
+    .replace(/\[[^\]]*\]/g, "")
+    .replace(/\{[^}]*\}/g, "")
+    .replace(/_/g, "")
+    .replace(/\*/g, "")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -89,227 +180,81 @@ function narrationText(text) {
     .trim();
 }
 
-function splitParts(text) {
-  const clean = cleanVoiceText(text);
-  const parts = [];
-  let rest = clean;
+function splitText(text, maxLength) {
+  const paragraphs = text.split(/\n+/);
+  const chunks = [];
+  let current = "";
 
-  while (rest.length > 0 && parts.length < 8) {
-    let part = rest.slice(0, 1800);
+  for (const p of paragraphs) {
+    const paragraph = p.trim();
+    if (!paragraph) continue;
 
-    const cut = Math.max(
-      part.lastIndexOf("."),
-      part.lastIndexOf("!"),
-      part.lastIndexOf("?")
-    );
-
-    if (cut > 700) {
-      part = part.slice(0, cut + 1);
+    if ((current + "\n" + paragraph).length > maxLength) {
+      if (current.trim()) chunks.push(current.trim());
+      current = paragraph;
+    } else {
+      current += "\n" + paragraph;
     }
-
-    parts.push(part.trim());
-    rest = rest.slice(part.length).trim();
   }
 
-  return parts.filter((p) => p.length > 80);
+  if (current.trim()) chunks.push(current.trim());
+
+  return chunks;
 }
 
-async function makeVoice(text) {
-  const res = await Promise.race([
-    fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`, {
-      method: "POST",
-      headers: {
-        "xi-api-key": ELEVEN_API_KEY,
-        "Content-Type": "application/json",
-        Accept: "audio/mpeg"
+async function elevenLabsTTS(text) {
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`;
+
+  const response = await axios.post(
+    url,
+    {
+      text,
+      model_id: "eleven_multilingual_v2",
+      voice_settings: {
+        stability: 0.45,
+        similarity_boost: 0.75,
+        style: 0.35,
+        use_speaker_boost: true,
       },
-      body: JSON.stringify({
-        text: narrationText(text),
-        model_id: "eleven_multilingual_v2",
-        voice_settings: {
-          stability: 0.65,
-          similarity_boost: 0.8,
-          style: 0.48,
-          use_speaker_boost: true
-        }
-      })
-    }),
-    timeout(45000)
-  ]);
-
-  if (!res.ok) {
-    throw new Error(await res.text());
-  }
-
-  return await res.buffer();
-}
-
-function isModernCopyrightRisk(query) {
-  const q = query.toLowerCase();
-
-  return (
-    q.includes("гарри поттер") ||
-    q.includes("harry potter") ||
-    q.includes("мастер и маргарита") ||
-    q.includes("булгаков")
+    },
+    {
+      headers: {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg",
+      },
+      responseType: "arraybuffer",
+      timeout: 60000,
+    }
   );
+
+  return Buffer.from(response.data);
 }
 
-async function wikiSearch(query) {
-  const url =
-    "https://ru.wikisource.org/w/api.php?action=query&list=search&format=json&srlimit=10&srsearch=" +
-    encodeURIComponent(query);
-
-  const data = await Promise.race([
-    fetch(url).then((r) => r.json()),
-    timeout(12000)
-  ]);
-
-  return data?.query?.search?.map((x) => x.title) || [];
+async function sendMessage(chatId, text) {
+  await axios.post(`${TG_API}/sendMessage`, {
+    chat_id: chatId,
+    text,
+  });
 }
 
-async function getWikiPage(title) {
-  const url =
-    "https://ru.wikisource.org/w/api.php?action=parse&format=json&prop=text|links&page=" +
-    encodeURIComponent(title);
+async function sendAudio(chatId, audioBuffer, filename, caption) {
+  const form = new FormData();
 
-  const data = await Promise.race([
-    fetch(url).then((r) => r.json()),
-    timeout(12000)
-  ]);
+  form.append("chat_id", chatId);
+  form.append("caption", caption);
+  form.append("audio", audioBuffer, {
+    filename,
+    contentType: "audio/mpeg",
+  });
 
-  if (!data.parse) return null;
-
-  return {
-    title: data.parse.title,
-    text: cleanHtml(data.parse.text?.["*"] || "")
-  };
+  await axios.post(`${TG_API}/sendAudio`, form, {
+    headers: form.getHeaders(),
+    maxContentLength: Infinity,
+    maxBodyLength: Infinity,
+  });
 }
-
-async function findBook(query) {
-  const titles = await wikiSearch(query);
-
-  for (const title of titles) {
-    const lower = title.toLowerCase();
-
-    if (
-      lower.includes("обсуждение") ||
-      lower.includes("категория") ||
-      lower.includes("автор:")
-    ) {
-      continue;
-    }
-
-    const page = await getWikiPage(title);
-
-    if (page && page.text.length > 1500) {
-      return page;
-    }
-  }
-
-  return null;
-}
-
-async function readBook(chatId, query) {
-  sessions.set(chatId, { active: true });
-
-  if (isModernCopyrightRisk(query)) {
-    await sendText(
-      chatId,
-      "Эта книга, скорее всего, защищена авторским правом. Я могу читать только легальные открытые тексты.\n\nПопробуй:\nПреступление и наказание Достоевский\nКапитанская дочка Пушкин\nШинель Гоголь"
-    );
-    sessions.delete(chatId);
-    return;
-  }
-
-  await sendText(chatId, "📖 Ищу легальный открытый текст книги...");
-
-  const book = await findBook(query);
-
-  if (!book) {
-    await sendText(
-      chatId,
-      "Не нашёл легальный открытый текст. Попробуй точнее: название + автор."
-    );
-    sessions.delete(chatId);
-    return;
-  }
-
-  await sendText(chatId, `Нашёл: ${book.title}\nГотовлю голос. Остановить: /stop`);
-
-  const parts = splitParts(book.text);
-
-  for (let i = 0; i < parts.length; i++) {
-    const session = sessions.get(chatId);
-
-    if (!session || !session.active) {
-      await sendText(chatId, "Чтение остановлено.");
-      sessions.delete(chatId);
-      return;
-    }
-
-    await sendAction(chatId);
-
-    const audio = await makeVoice(parts[i]);
-
-    await sendAudio(chatId, audio, `part_${i + 1}.mp3`, `Часть ${i + 1}`);
-  }
-
-  await sendText(chatId, "Чтение главы закончено.");
-  sessions.delete(chatId);
-}
-
-app.get("/", (req, res) => {
-  res.send("Book bot is running");
-});
-
-app.post("/", async (req, res) => {
-  res.sendStatus(200);
-
-  try {
-    const message = req.body.message;
-
-    if (!message || !message.text) return;
-
-    const chatId = message.chat.id;
-    const text = message.text.trim();
-
-    console.log("USER MESSAGE:", text);
-
-    if (text === "/start") {
-      await sendText(
-        chatId,
-        "Напиши название книги и автора.\nНапример: Преступление и наказание Достоевский"
-      );
-      return;
-    }
-
-    if (text === "/stop") {
-      const session = sessions.get(chatId);
-      if (session) session.active = false;
-
-      await sendText(chatId, "Останавливаю чтение.");
-      return;
-    }
-
-    if (sessions.get(chatId)?.active) {
-      await sendText(chatId, "Уже читаю. Напиши /stop.");
-      return;
-    }
-
-    readBook(chatId, text).catch(async (err) => {
-      console.log("READ ERROR:", err.message);
-      sessions.delete(chatId);
-      await sendText(chatId, "Ошибка чтения:\n" + err.message);
-    });
-  } catch (err) {
-    console.log("WEBHOOK ERROR:", err.message);
-  }
-});
-
-const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log("BOOK BOT CLEAN VOICE VERSION STARTED");
-  console.log("SERVER RUNNING ON " + PORT);
+  console.log(`SERVER RUNNING ON ${PORT}`);
 });

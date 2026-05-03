@@ -3,112 +3,182 @@ const axios = require("axios");
 const FormData = require("form-data");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "20mb" }));
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
+const PORT = process.env.PORT || 3000;
 
 const TG_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+const WIKI_API = "https://ru.wikisource.org/w/api.php";
 
-app.get("/", (req, res) => res.send("OK"));
+app.get("/", (req, res) => res.send("SERVER RUNNING"));
 
 app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
   res.sendStatus(200);
 
   try {
     const msg = req.body.message;
-    if (!msg?.text) return;
+    if (!msg?.chat?.id || !msg?.text) return;
 
     const chatId = msg.chat.id;
-    const text = msg.text.trim();
+    const userText = msg.text.trim();
 
-    console.log("USER MESSAGE:", text);
+    console.log("USER MESSAGE:", userText);
 
-    if (text === "/start") {
-      await sendMessage(chatId, "📚 Напиши книгу + автора");
+    if (userText === "/start") {
+      await sendMessage(
+        chatId,
+        "📚 Напиши название книги и автора.\n\nНапример:\nПреступление и наказание"
+      );
       return;
     }
 
-    if (isBlocked(text)) {
-      await sendMessage(chatId, "❌ Книга защищена авторским правом");
+    if (isBlocked(userText)) {
+      await sendMessage(chatId, "❌ Книга защищена авторским правом.");
       return;
     }
 
     await sendMessage(chatId, "🔎 Ищу в Викитеке...");
 
-    const page = await findWikisourcePage(text);
+    const page = await findWikisourcePage(userText);
 
     if (!page) {
-      await sendMessage(chatId, "❌ Не нашёл книгу");
+      await sendMessage(chatId, "❌ Не нашёл книгу в Викитеке.");
       return;
     }
 
     await sendMessage(chatId, `📖 Нашёл: ${page.title}`);
+    await sendMessage(chatId, "📥 Загружаю текст...");
 
-    const rawText = await getWikisourceText(page);
-    const cleanText = prepareText(rawText);
+    const rawText = await getWikisourceText(page.title);
+    const cleanText = cleanBookText(rawText);
+
+    console.log("CLEAN TEXT LENGTH:", cleanText.length);
+
+    if (cleanText.length < 700) {
+      await sendMessage(chatId, "❌ Нашёл страницу, но текста мало для озвучки.");
+      return;
+    }
 
     const chunk = cleanText.slice(0, 1500);
 
-    await sendMessage(chatId, "🎙 Озвучиваю...");
+    await sendMessage(chatId, "🎙 Озвучиваю первую часть...");
 
-    const audio = await tts(chunk);
+    const audioBuffer = await elevenLabsTTS(narrationText(chunk));
 
-    await sendAudio(chatId, audio);
+    await sendAudio(chatId, audioBuffer, "part_1.mp3", `📚 ${page.title}\nЧасть 1`);
 
-    await sendMessage(chatId, "✅ Готово");
+    await sendMessage(chatId, "✅ Готово.");
 
-  } catch (e) {
-    console.log("ERROR:", e.message);
+  } catch (error) {
+    console.log("SERVER ERROR:", error.response?.data || error.message || error);
   }
 });
 
 function isBlocked(text) {
   const t = text.toLowerCase();
-  return t.includes("гарри поттер") || t.includes("harry potter");
+
+  const blocked = [
+    "гарри поттер",
+    "harry potter",
+    "rowling",
+    "роулинг",
+    "стивен кинг",
+    "stephen king",
+    "метро 2033",
+    "лукьяненко",
+    "пелевин",
+    "акунин"
+  ];
+
+  return blocked.some((x) => t.includes(x));
 }
 
 async function findWikisourcePage(query) {
-  const url = `https://ru.wikisource.org/w/index.php?search=${encodeURIComponent(query)}`;
+  const res = await axios.get(WIKI_API, {
+    params: {
+      action: "opensearch",
+      search: query,
+      limit: 5,
+      namespace: 0,
+      format: "json"
+    },
+    timeout: 10000
+  });
 
-  const res = await axios.get(url);
+  console.log("WIKI OPENSEARCH:", JSON.stringify(res.data));
 
-  const match = res.data.match(/href="\/wiki\/([^"]+)"/);
+  const titles = res.data[1] || [];
 
-  if (!match) return null;
-
-  const title = decodeURIComponent(match[1]).replace(/_/g, " ");
+  if (!titles.length) return null;
 
   return {
-    title,
-    url: `https://ru.wikisource.org/wiki/${match[1]}`
+    title: titles[0]
   };
 }
 
-async function getWikisourceText(page) {
-  const res = await axios.get(page.url);
+async function getWikisourceText(title) {
+  const res = await axios.get(WIKI_API, {
+    params: {
+      action: "query",
+      prop: "extracts",
+      titles: title,
+      explaintext: 1,
+      exsectionformat: "plain",
+      format: "json"
+    },
+    timeout: 15000
+  });
 
-  return res.data
-    .replace(/<script[\s\S]*?<\/script>/g, "")
-    .replace(/<style[\s\S]*?<\/style>/g, "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ");
+  const pages = res.data.query?.pages || {};
+  const firstPage = Object.values(pages)[0];
+
+  console.log("RAW TEXT LENGTH:", firstPage?.extract?.length || 0);
+
+  return firstPage?.extract || "";
 }
 
-function prepareText(text) {
-  return text
+function cleanBookText(text) {
+  return String(text || "")
+    .replace(/\r/g, "")
+    .replace(/\n{3,}/g, "\n\n")
     .replace(/\[[^\]]*\]/g, "")
+    .replace(/\{[^}]*\}/g, "")
+    .replace(/↑/g, "")
+    .replace(/См. также[\s\S]*$/i, "")
+    .replace(/Примечания[\s\S]*$/i, "")
+    .replace(/Источники[\s\S]*$/i, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+function cleanVoiceText(text) {
+  return String(text || "")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-async function tts(text) {
+function narrationText(text) {
+  return cleanVoiceText(text)
+    .replace(/([.!?])\s+/g, "$1...\n\n")
+    .replace(/—/g, " — ")
+    .trim();
+}
+
+async function elevenLabsTTS(text) {
   const res = await axios.post(
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
     {
       text,
-      model_id: "eleven_multilingual_v2"
+      model_id: "eleven_multilingual_v2",
+      voice_settings: {
+        stability: 0.45,
+        similarity_boost: 0.8,
+        style: 0.35,
+        use_speaker_boost: true
+      }
     },
     {
       headers: {
@@ -116,7 +186,8 @@ async function tts(text) {
         "Content-Type": "application/json",
         Accept: "audio/mpeg"
       },
-      responseType: "arraybuffer"
+      responseType: "arraybuffer",
+      timeout: 60000
     }
   );
 
@@ -130,18 +201,23 @@ async function sendMessage(chatId, text) {
   });
 }
 
-async function sendAudio(chatId, buffer) {
+async function sendAudio(chatId, audioBuffer, filename, caption) {
   const form = new FormData();
 
   form.append("chat_id", chatId);
-  form.append("audio", buffer, {
-    filename: "voice.mp3",
+  form.append("caption", caption);
+  form.append("audio", audioBuffer, {
+    filename,
     contentType: "audio/mpeg"
   });
 
   await axios.post(`${TG_API}/sendAudio`, form, {
-    headers: form.getHeaders()
+    headers: form.getHeaders(),
+    maxContentLength: Infinity,
+    maxBodyLength: Infinity
   });
 }
 
-app.listen(3000, () => console.log("SERVER RUNNING"));
+app.listen(PORT, () => {
+  console.log(`SERVER RUNNING ON ${PORT}`);
+});

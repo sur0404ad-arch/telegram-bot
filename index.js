@@ -3,7 +3,7 @@ const fetch = require("node-fetch");
 const FormData = require("form-data");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
@@ -19,34 +19,84 @@ async function sendText(chatId, text) {
   });
 }
 
-async function sendAudio(chatId, audioBuffer, filename) {
+async function sendAction(chatId, action = "upload_audio") {
+  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, action }),
+  });
+}
+
+async function sendAudio(chatId, audioBuffer, filename, caption = "") {
   const form = new FormData();
+
   form.append("chat_id", chatId);
   form.append("audio", audioBuffer, {
     filename,
     contentType: "audio/mpeg",
   });
 
-  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendAudio`, {
+  if (caption) form.append("caption", caption);
+
+  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendAudio`, {
     method: "POST",
     headers: form.getHeaders(),
     body: form,
   });
+
+  if (!res.ok) throw new Error(await res.text());
+}
+
+function cleanHtml(html) {
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<sup[\s\S]*?<\/sup>/gi, "")
+    .replace(/<table[\s\S]*?<\/table>/gi, "")
+    .replace(/<div[^>]*(metadata|noprint|mw-editsection|printfooter|catlinks)[\s\S]*?<\/div>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;|&#160;/g, " ")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/\[[^\]]*\]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function prepareForVoice(text) {
   return text
-    .replace(/Викитека|Материал из Викитеки/gi, "")
-    .replace(/Содержание|Править|править код|Источник/gi, "")
-    .replace(/\[[0-9]+\]/g, "")
+    .replace(/Материал из Викитеки|Викитека|Содержание|Править|править код/gi, "")
+    .replace(/Перейти к навигации|Перейти к поиску/gi, "")
     .replace(/[^\p{L}\p{N}\s.,!?;:—\-«»"()]/gu, "")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-async function makeVoice(text) {
+function splitText(text, max = 3500) {
   const clean = prepareForVoice(text);
+  const parts = [];
+  let rest = clean;
 
+  while (rest.length > 0) {
+    let part = rest.slice(0, max);
+
+    const cut = Math.max(
+      part.lastIndexOf("."),
+      part.lastIndexOf("!"),
+      part.lastIndexOf("?"),
+      part.lastIndexOf("»")
+    );
+
+    if (cut > 1600) part = part.slice(0, cut + 1);
+
+    parts.push(part.trim());
+    rest = rest.slice(part.length).trim();
+  }
+
+  return parts.filter((p) => p.length > 200);
+}
+
+async function makeVoice(text) {
   const res = await fetch(
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
     {
@@ -57,12 +107,12 @@ async function makeVoice(text) {
         Accept: "audio/mpeg",
       },
       body: JSON.stringify({
-        text: clean,
+        text: prepareForVoice(text),
         model_id: "eleven_multilingual_v2",
         voice_settings: {
-          stability: 0.75,
-          similarity_boost: 0.9,
-          style: 0.12,
+          stability: 0.42,
+          similarity_boost: 0.85,
+          style: 0.22,
           use_speaker_boost: true,
         },
       }),
@@ -71,44 +121,6 @@ async function makeVoice(text) {
 
   if (!res.ok) throw new Error(await res.text());
   return res.buffer();
-}
-
-function htmlToText(html) {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/g, "")
-    .replace(/<script[\s\S]*?<\/script>/g, "")
-    .replace(/<sup[\s\S]*?<\/sup>/g, "")
-    .replace(/<table[\s\S]*?<\/table>/g, "")
-    .replace(/<div[^>]*(class="[^"]*(printfooter|catlinks|metadata|noprint|mw-editsection)[^"]*")[^>]*>[\s\S]*?<\/div>/gi, "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&quot;/g, '"')
-    .replace(/&amp;/g, "&")
-    .replace(/&#160;/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-splitText(book.text, 3500)
-  const parts = [];
-  let rest = prepareForVoice(text);
-
-  while (rest.length > 0) {
-    let part = rest.slice(0, max);
-    const cut = Math.max(
-      part.lastIndexOf("."),
-      part.lastIndexOf("!"),
-      part.lastIndexOf("?"),
-      part.lastIndexOf(";")
-    );
-
-    if (cut > 400) part = part.slice(0, cut + 1);
-
-    parts.push(part.trim());
-    rest = rest.slice(part.length).trim();
-  }
-
-  return parts.filter((p) => p.length > 50);
 }
 
 async function wikiSearch(query) {
@@ -126,14 +138,25 @@ async function getWikiPage(title) {
     encodeURIComponent(title);
 
   const data = await fetch(url).then((r) => r.json());
-
   if (!data.parse) return null;
 
   return {
     title: data.parse.title,
-    text: htmlToText(data.parse.text?.["*"] || ""),
+    text: cleanHtml(data.parse.text?.["*"] || ""),
     links: data.parse.links || [],
   };
+}
+
+function badTitle(title) {
+  const t = title.toLowerCase();
+  return (
+    t.includes("эпилог") ||
+    t.includes("обсуждение") ||
+    t.includes("категория") ||
+    t.includes("автор:") ||
+    t.includes("письмо") ||
+    t.includes("комментар")
+  );
 }
 
 function scoreTitle(title, query) {
@@ -141,50 +164,74 @@ function scoreTitle(title, query) {
   const q = query.toLowerCase();
 
   let score = 0;
+
   if (t.includes(q)) score += 100;
-  if (t.includes("(")) score += 20;
-  if (t.includes("/")) score += 10;
-  if (t.includes("автор")) score -= 30;
-  if (t.includes("обсуждение")) score -= 50;
-  if (t.includes("категория")) score -= 50;
+  if (t.includes("(")) score += 30;
+  if (t.includes("/часть первая")) score += 80;
+  if (t.includes("/часть 1")) score += 80;
+  if (t.includes("/i")) score += 50;
+  if (t.includes("/глава i")) score += 50;
+  if (t.includes("/эпилог")) score -= 500;
+  if (badTitle(title)) score -= 300;
 
   return score;
 }
 
+function sortBookLinks(links, mainTitle) {
+  return links
+    .map((l) => l["*"])
+    .filter(Boolean)
+    .filter((x) => x.startsWith(mainTitle + "/"))
+    .filter((x) => !badTitle(x))
+    .sort((a, b) => {
+      const aa = a.toLowerCase();
+      const bb = b.toLowerCase();
+
+      const priority = (x) => {
+        if (x.includes("часть первая")) return 1;
+        if (x.includes("часть 1")) return 1;
+        if (x.endsWith("/i")) return 2;
+        if (x.includes("глава i")) return 2;
+        if (x.includes("часть вторая")) return 20;
+        if (x.includes("часть 2")) return 20;
+        return 10;
+      };
+
+      return priority(aa) - priority(bb) || a.localeCompare(b, "ru");
+    });
+}
+
 async function findBook(query) {
   const titles = await wikiSearch(query);
-
   if (!titles.length) return null;
 
-  const sorted = titles.sort((a, b) => scoreTitle(b, query) - scoreTitle(a, query));
+  const sorted = titles
+    .filter((t) => !badTitle(t))
+    .sort((a, b) => scoreTitle(b, query) - scoreTitle(a, query));
 
-  for (const title of sorted.slice(0, 5)) {
+  for (const title of sorted.slice(0, 6)) {
     const page = await getWikiPage(title);
     if (!page) continue;
 
-    if (page.text.length > 5000) {
+    if (page.text.length > 8000 && !badTitle(page.title)) {
       return { title: page.title, text: page.text };
     }
 
-    const childLinks = page.links
-      .map((l) => l["*"])
-      .filter((x) => x && x.startsWith(page.title + "/"))
-      .filter((x) => !x.includes("Обсуждение"))
-      .slice(0, 40);
+    const childLinks = sortBookLinks(page.links, page.title).slice(0, 25);
 
-    let full = "";
+    let fullText = "";
 
     for (const childTitle of childLinks) {
       const child = await getWikiPage(childTitle);
-      if (!child || child.text.length < 500) continue;
+      if (!child || child.text.length < 800) continue;
 
-      full += "\n\n" + child.text;
+      fullText += "\n\n" + child.text;
 
-      if (full.length > 60000) break;
+      if (fullText.length > 120000) break;
     }
 
-    if (full.length > 3000) {
-      return { title: page.title, text: full };
+    if (fullText.length > 5000) {
+      return { title: page.title, text: fullText };
     }
   }
 
@@ -192,20 +239,37 @@ async function findBook(query) {
 }
 
 async function readBook(chatId, book) {
-  const parts = splitText(book.text, 900);
+  const parts = splitText(book.text, 3500);
+
   sessions.set(chatId, { active: true });
 
-  await sendText(chatId, `Нашёл: ${book.title}\nНачинаю читать.\nОстановить: /stop`);
+  await sendText(
+    chatId,
+    `Нашёл: ${book.title}\n\nГотовлю первую аудио-часть. Подождите 20–40 секунд.\nДальше части будут приходить подряд.\n\nОстановить: /stop`
+  );
 
   for (let i = 0; i < parts.length; i++) {
     const session = sessions.get(chatId);
+
     if (!session || !session.active) {
       await sendText(chatId, "Чтение остановлено.");
       return;
     }
 
+    await sendAction(chatId, "upload_audio");
+
+    if (i > 0) {
+      await sendText(chatId, `Готовлю часть ${i + 1}...`);
+    }
+
     const audio = await makeVoice(parts[i]);
-    await sendAudio(chatId, audio, `part_${i + 1}.mp3`);
+
+    await sendAudio(
+      chatId,
+      audio,
+      `part_${i + 1}.mp3`,
+      `Часть ${i + 1} из ${parts.length}`
+    );
 
     await new Promise((r) => setTimeout(r, 1200));
   }
@@ -229,7 +293,10 @@ app.post("/", async (req, res) => {
     const text = message.text.trim();
 
     if (text === "/start") {
-      await sendText(chatId, "Напиши название книги. Я найду текст и начну читать.");
+      await sendText(
+        chatId,
+        "Напиши название книги и автора. Например:\nПреступление и наказание Достоевский"
+      );
       return;
     }
 
@@ -245,12 +312,15 @@ app.post("/", async (req, res) => {
       return;
     }
 
-    await sendText(chatId, "Ищу книгу...");
+    await sendText(chatId, "Ищу книгу в интернете. Подождите пожалуйста...");
 
     const book = await findBook(text);
 
     if (!book) {
-      await sendText(chatId, "Не нашёл книгу. Попробуй точнее: автор + название.");
+      await sendText(
+        chatId,
+        "Не нашёл нормальный текст. Попробуй точнее: название + автор.\n\nНапример:\nПреступление и наказание Достоевский"
+      );
       return;
     }
 

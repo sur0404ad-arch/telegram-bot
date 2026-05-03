@@ -11,15 +11,22 @@ const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;
 
 const sessions = new Map();
 
-async function sendText(chatId, text) {
-  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+async function tg(method, payload) {
+  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text }),
+    body: JSON.stringify(payload),
   });
+
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
 }
 
-async function sendAudio(chatId, audioBuffer, filename = "book.mp3") {
+async function sendText(chatId, text) {
+  return tg("sendMessage", { chat_id: chatId, text });
+}
+
+async function sendAudio(chatId, audioBuffer, filename) {
   const form = new FormData();
   form.append("chat_id", chatId);
   form.append("audio", audioBuffer, {
@@ -27,14 +34,16 @@ async function sendAudio(chatId, audioBuffer, filename = "book.mp3") {
     contentType: "audio/mpeg",
   });
 
-  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendAudio`, {
+  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendAudio`, {
     method: "POST",
     headers: form.getHeaders(),
     body: form,
   });
+
+  if (!res.ok) throw new Error(await res.text());
 }
 
-async function elevenLabs(text) {
+async function makeVoice(text) {
   const res = await fetch(
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
     {
@@ -55,67 +64,66 @@ async function elevenLabs(text) {
     }
   );
 
-  if (!res.ok) {
-    throw new Error(await res.text());
-  }
-
-  return await res.buffer();
+  if (!res.ok) throw new Error(await res.text());
+  return res.buffer();
 }
 
-async function searchBook(query) {
-  // 1. пробуем Gutenberg
-  const gut = await fetch(`https://gutendex.com/books?search=${encodeURIComponent(query)}`)
-    .then(r => r.json());
+function cleanText(text) {
+  return text
+    .replace(/\r/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/\s{2,}/g, " ")
+    .replace(/\*\*\* START[\s\S]*?\*\*\*/i, "")
+    .replace(/\*\*\* END[\s\S]*/i, "")
+    .trim();
+}
 
-  if (gut.results && gut.results.length > 0) {
-    const book = gut.results[0];
+function splitText(text, max = 1800) {
+  const parts = [];
+  let rest = text;
 
-    const url =
-      book.formats["text/plain; charset=utf-8"] ||
-      book.formats["text/plain"];
+  while (rest.length > 0) {
+    let part = rest.slice(0, max);
+    const cut = Math.max(
+      part.lastIndexOf("."),
+      part.lastIndexOf("!"),
+      part.lastIndexOf("?"),
+      part.lastIndexOf("\n")
+    );
 
-    if (url) {
-      const text = await fetch(url).then(r => r.text());
+    if (cut > 800) part = part.slice(0, cut + 1);
 
-      return {
-        title: book.title,
-        text
-      };
-    }
+    parts.push(part.trim());
+    rest = rest.slice(part.length).trim();
   }
 
-  // 2. fallback — Wikisource (старый метод)
-  const searchUrl =
-    "https://ru.wikisource.org/w/api.php?action=opensearch&format=json&limit=5&search=" +
-    encodeURIComponent(query);
+  return parts.filter(Boolean);
+}
 
-  const data = await fetch(searchUrl).then(r => r.json());
-  const title = data?.[1]?.[0];
+async function searchGutendex(query) {
+  const url = `https://gutendex.com/books?search=${encodeURIComponent(query)}`;
+  const data = await fetch(url).then((r) => r.json());
 
-  if (!title) return null;
+  if (!data.results || !data.results.length) return null;
 
-  const pageUrl =
-    "https://ru.wikisource.org/w/api.php?action=parse&format=json&prop=text&page=" +
-    encodeURIComponent(title);
+  const book = data.results[0];
+  const textUrl =
+    book.formats["text/plain; charset=utf-8"] ||
+    book.formats["text/plain; charset=us-ascii"] ||
+    book.formats["text/plain"];
 
-  const page = await fetch(pageUrl).then(r => r.json());
-  const html = page?.parse?.text?.["*"];
+  if (!textUrl) return null;
 
-  if (!html) return null;
-
-  const cleanText = html
-    .replace(/<style[\s\S]*?<\/style>/g, "")
-    .replace(/<script[\s\S]*?<\/script>/g, "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\[[^\]]*\]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  const raw = await fetch(textUrl).then((r) => r.text());
 
   return {
-    title,
-    text: cleanText
+    title: book.title,
+    source: "Project Gutenberg",
+    text: cleanText(raw),
   };
 }
+
+async function searchWikisource(query) {
   const searchUrl =
     "https://ru.wikisource.org/w/api.php?action=opensearch&format=json&limit=5&search=" +
     encodeURIComponent(query);
@@ -134,64 +142,75 @@ async function searchBook(query) {
 
   if (!html) return null;
 
-  const cleanText = html
+  const text = html
     .replace(/<style[\s\S]*?<\/style>/g, "")
     .replace(/<script[\s\S]*?<\/script>/g, "")
     .replace(/<[^>]+>/g, " ")
-    .replace(/\[[^\]]*\]/g, "")
     .replace(/&nbsp;/g, " ")
     .replace(/&quot;/g, '"')
     .replace(/&amp;/g, "&")
+    .replace(/\[[^\]]*\]/g, "")
     .replace(/\s+/g, " ")
     .trim();
 
+  if (text.length < 1000) return null;
+
   return {
     title,
-    text: cleanText,
+    source: "Wikisource",
+    text,
   };
 }
 
-function makeParts(text, size = 1800) {
-  const parts = [];
-  let i = 0;
+async function findBook(query) {
+  const sources = [
+    () => searchWikisource(query),
+    () => searchGutendex(query),
+  ];
 
-  while (i < text.length) {
-    let part = text.slice(i, i + size);
-    const lastDot = Math.max(
-      part.lastIndexOf("."),
-      part.lastIndexOf("!"),
-      part.lastIndexOf("?")
-    );
-
-    if (lastDot > 700) {
-      part = part.slice(0, lastDot + 1);
+  for (const source of sources) {
+    try {
+      const book = await source();
+      if (book && book.text && book.text.length > 1000) return book;
+    } catch (e) {
+      console.log("SOURCE ERROR:", e.message);
     }
-
-    parts.push(part.trim());
-    i += part.length;
   }
 
-  return parts.filter(Boolean);
+  return null;
 }
 
-async function readStream(chatId, title, text) {
-  const parts = makeParts(text);
+async function readBookStream(chatId, book) {
+  const parts = splitText(book.text, 1800);
 
-  sessions.set(chatId, { stop: false });
+  sessions.set(chatId, {
+    active: true,
+    title: book.title,
+    index: 0,
+  });
 
-  await sendText(chatId, `Нашёл: ${title}\nНачинаю читать потоком.`);
+  await sendText(
+    chatId,
+    `Нашёл: ${book.title}\nИсточник: ${book.source}\nНачинаю читать потоком.\nКоманда остановки: /stop`
+  );
 
   for (let i = 0; i < parts.length; i++) {
     const session = sessions.get(chatId);
-    if (!session || session.stop) {
+
+    if (!session || !session.active) {
       await sendText(chatId, "Чтение остановлено.");
       return;
     }
 
-    const audio = await elevenLabs(parts[i]);
-    await sendAudio(chatId, audio, `book_part_${i + 1}.mp3`);
+    session.index = i;
+
+    const audio = await makeVoice(parts[i]);
+    await sendAudio(chatId, audio, `part_${i + 1}.mp3`);
+
+    await new Promise((resolve) => setTimeout(resolve, 1500));
   }
 
+  sessions.delete(chatId);
   await sendText(chatId, "Книга закончилась.");
 }
 
@@ -209,37 +228,45 @@ app.post("/", async (req, res) => {
     const chatId = message.chat.id;
     const text = message.text.trim();
 
-    if (text === "/stop") {
-      sessions.set(chatId, { stop: true });
-      return;
-    }
-
     if (text === "/start") {
       await sendText(
         chatId,
-        "Напиши название книги. Я найду её в интернете и начну читать голосом."
+        "Напиши название книги. Я найду легальный открытый текст и начну читать голосом."
       );
+      return;
+    }
+
+    if (text === "/stop") {
+      const session = sessions.get(chatId);
+      if (session) session.active = false;
+      await sendText(chatId, "Останавливаю чтение.");
+      return;
+    }
+
+    if (sessions.get(chatId)?.active) {
+      await sendText(chatId, "Сейчас уже идёт чтение. Напиши /stop, чтобы остановить.");
       return;
     }
 
     await sendText(chatId, "Ищу книгу в интернете...");
 
-    const book = await searchBook(text);
+    const book = await findBook(text);
 
-    if (!book || !book.text || book.text.length < 1000) {
+    if (!book) {
       await sendText(
         chatId,
-        "Не нашёл нормальный текст книги в легальном открытом источнике. Попробуй: Пушкин, Гоголь, Толстой, Достоевский."
+        "Не нашёл легальный открытый текст этой книги.\n\nПопробуй:\n- Преступление и наказание\n- Война и мир\n- Капитанская дочка\n- Шинель\n- Анна Каренина\n\nЕсли книга современная или защищена авторским правом — пришли текст, и я озвучу."
       );
       return;
     }
 
-    await readStream(chatId, book.title, book.text);
+    readBookStream(chatId, book).catch(async (error) => {
+      console.log("STREAM ERROR:", error.message);
+      await sendText(chatId, "Ошибка чтения:\n" + error.message);
+      sessions.delete(chatId);
+    });
   } catch (error) {
     console.log("ERROR:", error.message);
-    if (req.body.message?.chat?.id) {
-      await sendText(req.body.message.chat.id, "Ошибка:\n" + error.message);
-    }
   }
 });
 

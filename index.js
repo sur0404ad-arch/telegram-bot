@@ -1,10 +1,11 @@
-console.log("FAST VERSION STARTED");
+console.log("FINAL FAST READER VERSION STARTED");
 
 const express = require("express");
 const fetch = require("node-fetch");
+const FormData = require("form-data");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
@@ -12,9 +13,12 @@ const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;
 
 const sessions = new Map();
 
-// =====================
-// TELEGRAM SEND
-// =====================
+function timeout(ms) {
+  return new Promise((_, reject) =>
+    setTimeout(() => reject(new Error("TIMEOUT")), ms)
+  );
+}
+
 async function sendText(chatId, text) {
   await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     method: "POST",
@@ -23,98 +27,290 @@ async function sendText(chatId, text) {
   });
 }
 
-async function sendAudio(chatId, buffer) {
-  const form = new FormData();
-  form.append("chat_id", chatId);
-  form.append("audio", buffer, "voice.mp3");
-
-  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendAudio`, {
+async function sendAction(chatId) {
+  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`, {
     method: "POST",
-    body: form,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, action: "upload_audio" }),
   });
 }
 
-// =====================
-// БЫСТРАЯ ЗАГРУЗКА ТЕКСТА (с таймаутом)
-// =====================
-async function getBookTextFast() {
-  const controller = new AbortController();
+async function sendAudio(chatId, buffer, filename, caption = "") {
+  const form = new FormData();
+  form.append("chat_id", chatId);
+  form.append("audio", buffer, {
+    filename,
+    contentType: "audio/mpeg",
+  });
+  if (caption) form.append("caption", caption);
 
-  // ⛔ ограничение 10 секунд
-  setTimeout(() => controller.abort(), 10000);
+  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendAudio`, {
+    method: "POST",
+    headers: form.getHeaders(),
+    body: form,
+  });
 
-  try {
-    const res = await fetch(
-      "https://www.gutenberg.org/files/2554/2554-0.txt",
-      { signal: controller.signal }
-    );
-
-    const text = await res.text();
-
-    return text.slice(0, 3000); // ⚡ только начало
-  } catch (e) {
-    return null;
-  }
+  if (!res.ok) throw new Error(await res.text());
 }
 
-// =====================
-// ГОЛОС (БЫСТРЫЙ)
-// =====================
-async function generateVoice(text) {
-  const res = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
-    {
+function cleanHtml(html) {
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<sup[\s\S]*?<\/sup>/gi, "")
+    .replace(/<table[\s\S]*?<\/table>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;|&#160;/g, " ")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/\[[^\]]*\]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function cleanVoiceText(text) {
+  return text
+    .replace(/Материал из Викитеки|Викитека|Содержание|Править|править код/gi, "")
+    .replace(/Перейти к навигации|Перейти к поиску|Источник|См. также/gi, "")
+    .replace(/Эта страница в последний раз была отредактирована[\s\S]*/gi, "")
+    .replace(/[^\p{L}\p{N}\s.,!?;:—\-«»"()]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function splitParts(text) {
+  const clean = cleanVoiceText(text);
+  const parts = [];
+
+  let first = clean.slice(0, 550);
+  let cut = Math.max(first.lastIndexOf("."), first.lastIndexOf("!"), first.lastIndexOf("?"));
+  if (cut > 180) first = first.slice(0, cut + 1);
+  parts.push(first.trim());
+
+  let rest = clean.slice(first.length).trim();
+
+  while (rest.length > 0 && parts.length < 12) {
+    let part = rest.slice(0, 2200);
+    cut = Math.max(part.lastIndexOf("."), part.lastIndexOf("!"), part.lastIndexOf("?"));
+    if (cut > 900) part = part.slice(0, cut + 1);
+
+    parts.push(part.trim());
+    rest = rest.slice(part.length).trim();
+  }
+
+  return parts.filter((p) => p.length > 80);
+}
+
+async function makeVoice(text) {
+  const res = await Promise.race([
+    fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`, {
       method: "POST",
       headers: {
         "xi-api-key": ELEVEN_API_KEY,
         "Content-Type": "application/json",
+        Accept: "audio/mpeg",
       },
       body: JSON.stringify({
-        text,
-        model_id: "eleven_turbo_v2", // ⚡ быстрее
+        text: cleanVoiceText(text),
+        model_id: "eleven_turbo_v2_5",
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.9,
+          style: 0.25,
+          use_speaker_boost: true,
+        },
       }),
-    }
-  );
+    }),
+    timeout(45000),
+  ]);
 
-  return await res.buffer();
+  if (!res.ok) throw new Error(await res.text());
+  return res.buffer();
 }
 
-// =====================
-// WEBHOOK
-// =====================
-app.post("/", async (req, res) => {
-  const message = req.body.message;
-  if (!message) return res.sendStatus(200);
+function badTitle(title) {
+  const t = title.toLowerCase();
+  return (
+    t.includes("эпилог") ||
+    t.includes("обсуждение") ||
+    t.includes("категория") ||
+    t.includes("автор:") ||
+    t.includes("комментар") ||
+    t.includes("письмо")
+  );
+}
 
-  const chatId = message.chat.id;
-  const text = message.text;
+function linkPriority(title) {
+  const t = title.toLowerCase();
 
-  // STOP
-  if (text === "/stop") {
+  if (badTitle(t)) return 999;
+  if (t.includes("часть первая")) return 1;
+  if (t.includes("часть 1")) return 1;
+  if (t.includes("глава i")) return 2;
+  if (t.endsWith("/i")) return 2;
+  if (t.endsWith("/1")) return 3;
+  if (t.includes("часть вторая")) return 50;
+  if (t.includes("часть 2")) return 50;
+
+  return 10;
+}
+
+async function wikiSearch(query) {
+  const url =
+    "https://ru.wikisource.org/w/api.php?action=query&list=search&format=json&srlimit=12&srsearch=" +
+    encodeURIComponent(query);
+
+  const data = await Promise.race([
+    fetch(url).then((r) => r.json()),
+    timeout(12000),
+  ]);
+
+  return data?.query?.search?.map((x) => x.title).filter((x) => !badTitle(x)) || [];
+}
+
+async function getWikiPage(title) {
+  const url =
+    "https://ru.wikisource.org/w/api.php?action=parse&format=json&prop=text|links&page=" +
+    encodeURIComponent(title);
+
+  const data = await Promise.race([
+    fetch(url).then((r) => r.json()),
+    timeout(12000),
+  ]);
+
+  if (!data.parse) return null;
+
+  return {
+    title: data.parse.title,
+    text: cleanHtml(data.parse.text?.["*"] || ""),
+    links: data.parse.links || [],
+  };
+}
+
+async function findBookStart(query) {
+  const titles = await wikiSearch(query);
+  if (!titles.length) return null;
+
+  for (const title of titles.slice(0, 6)) {
+    const page = await getWikiPage(title);
+    if (!page) continue;
+
+    const childTitles = page.links
+      .map((l) => l["*"])
+      .filter(Boolean)
+      .filter((x) => x.startsWith(page.title + "/"))
+      .filter((x) => !badTitle(x))
+      .sort((a, b) => linkPriority(a) - linkPriority(b) || a.localeCompare(b, "ru"))
+      .slice(0, 8);
+
+    for (const childTitle of childTitles) {
+      const child = await getWikiPage(childTitle);
+      if (child && child.text.length > 1200 && !badTitle(child.title)) {
+        return { title: child.title, text: child.text };
+      }
+    }
+
+    if (page.text.length > 2500 && !badTitle(page.title)) {
+      return { title: page.title, text: page.text };
+    }
+  }
+
+  return null;
+}
+
+async function keepAlive(chatId) {
+  const id = setInterval(() => {
+    sendAction(chatId).catch(() => {});
+  }, 4000);
+  return () => clearInterval(id);
+}
+
+async function readBook(chatId, query) {
+  sessions.set(chatId, { active: true });
+
+  await sendText(chatId, "Принял. Ищу начало книги. Сначала отправлю короткий голос, потом пойдут части.");
+
+  const stopAlive = await keepAlive(chatId);
+
+  try {
+    const introAudio = await makeVoice(
+      `Начинаю подготовку книги: ${query}. Сейчас найду начало текста и отправлю первую часть.`
+    );
+    await sendAudio(chatId, introAudio, "intro.mp3", "Начинаю");
+  } catch (e) {
+    console.log("INTRO ERROR:", e.message);
+  }
+
+  const book = await findBookStart(query);
+
+  if (!book) {
+    stopAlive();
     sessions.delete(chatId);
-    await sendText(chatId, "Остановлено.");
-    return res.sendStatus(200);
+    await sendText(chatId, "Не нашёл текст. Попробуй точнее: название плюс автор.");
+    return;
   }
 
-  // СРАЗУ ОТВЕТ (убираем паузу)
-  await sendText(chatId, "Ищу текст... готовлю голос (5–10 сек)");
+  const parts = splitParts(book.text);
 
-  // ПАРАЛЛЕЛЬНО
-  const bookText = await getBookTextFast();
+  await sendText(chatId, `Нашёл: ${book.title}\nОтправляю чтение. Остановить: /stop`);
 
-  if (!bookText) {
-    await sendText(chatId, "Ошибка загрузки. Попробуй позже.");
-    return res.sendStatus(200);
+  for (let i = 0; i < parts.length; i++) {
+    const session = sessions.get(chatId);
+    if (!session || !session.active) {
+      stopAlive();
+      await sendText(chatId, "Чтение остановлено.");
+      return;
+    }
+
+    const audio = await makeVoice(parts[i]);
+    await sendAudio(chatId, audio, `part_${i + 1}.mp3`, `Часть ${i + 1}`);
   }
 
-  const voice = await generateVoice(bookText);
+  stopAlive();
+  sessions.delete(chatId);
+  await sendText(chatId, "Глава закончилась.");
+}
 
-  await sendAudio(chatId, voice);
+app.get("/", (req, res) => {
+  res.send("Final fast reader is running");
+});
 
+app.post("/", async (req, res) => {
   res.sendStatus(200);
+
+  try {
+    const message = req.body.message;
+    if (!message || !message.text) return;
+
+    const chatId = message.chat.id;
+    const text = message.text.trim();
+
+    if (text === "/start") {
+      await sendText(chatId, "Напиши название книги и автора. Например: Преступление и наказание Достоевский");
+      return;
+    }
+
+    if (text === "/stop") {
+      const session = sessions.get(chatId);
+      if (session) session.active = false;
+      await sendText(chatId, "Останавливаю чтение.");
+      return;
+    }
+
+    if (sessions.get(chatId)?.active) {
+      await sendText(chatId, "Уже читаю. Напиши /stop.");
+      return;
+    }
+
+    readBook(chatId, text).catch(async (err) => {
+      console.log("READ ERROR:", err.message);
+      sessions.delete(chatId);
+      await sendText(chatId, "Ошибка чтения:\n" + err.message);
+    });
+  } catch (err) {
+    console.log("WEBHOOK ERROR:", err.message);
+  }
 });
 
-// =====================
-app.listen(3000, () => {
-  console.log("FAST BOT RUNNING");
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("FINAL FAST READER VERSION STARTED"));

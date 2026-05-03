@@ -29,13 +29,11 @@ async function sendAction(chatId, action = "upload_audio") {
 
 async function sendAudio(chatId, audioBuffer, filename, caption = "") {
   const form = new FormData();
-
   form.append("chat_id", chatId);
   form.append("audio", audioBuffer, {
     filename,
     contentType: "audio/mpeg",
   });
-
   if (caption) form.append("caption", caption);
 
   const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendAudio`, {
@@ -45,6 +43,44 @@ async function sendAudio(chatId, audioBuffer, filename, caption = "") {
   });
 
   if (!res.ok) throw new Error(await res.text());
+}
+
+function prepareForVoice(text) {
+  return text
+    .replace(/Материал из Викитеки|Викитека|Содержание|Править|править код/gi, "")
+    .replace(/Перейти к навигации|Перейти к поиску/gi, "")
+    .replace(/[^\p{L}\p{N}\s.,!?;:—\-«»"()]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function makeVoice(text) {
+  const clean = prepareForVoice(text).slice(0, 4500);
+
+  const res = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVEN_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg",
+      },
+      body: JSON.stringify({
+        text: clean,
+        model_id: "eleven_multilingual_v2",
+        voice_settings: {
+          stability: 0.62,
+          similarity_boost: 0.85,
+          style: 0.08,
+          use_speaker_boost: true,
+        },
+      }),
+    }
+  );
+
+  if (!res.ok) throw new Error(await res.text());
+  return res.buffer();
 }
 
 function cleanHtml(html) {
@@ -63,23 +99,20 @@ function cleanHtml(html) {
     .trim();
 }
 
-function prepareForVoice(text) {
-  return text
-    .replace(/Материал из Викитеки|Викитека|Содержание|Править|править код/gi, "")
-    .replace(/Перейти к навигации|Перейти к поиску/gi, "")
-    .replace(/[^\p{L}\p{N}\s.,!?;:—\-«»"()]/gu, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function splitText(text, max = 3500) {
+function splitSmart(text) {
   const clean = prepareForVoice(text);
-  const parts = [];
-  let rest = clean;
+
+  const first = clean.slice(0, 900);
+  const firstCut = Math.max(first.lastIndexOf("."), first.lastIndexOf("!"), first.lastIndexOf("?"));
+  const firstPart = firstCut > 300 ? first.slice(0, firstCut + 1) : first;
+
+  const parts = [firstPart.trim()];
+  let rest = clean.slice(firstPart.length).trim();
+
+  const max = 3200;
 
   while (rest.length > 0) {
     let part = rest.slice(0, max);
-
     const cut = Math.max(
       part.lastIndexOf("."),
       part.lastIndexOf("!"),
@@ -87,7 +120,7 @@ function splitText(text, max = 3500) {
       part.lastIndexOf("»")
     );
 
-    if (cut > 1600) part = part.slice(0, cut + 1);
+    if (cut > 1200) part = part.slice(0, cut + 1);
 
     parts.push(part.trim());
     rest = rest.slice(part.length).trim();
@@ -96,36 +129,9 @@ function splitText(text, max = 3500) {
   return parts.filter((p) => p.length > 200);
 }
 
-async function makeVoice(text) {
-  const res = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
-    {
-      method: "POST",
-      headers: {
-        "xi-api-key": ELEVEN_API_KEY,
-        "Content-Type": "application/json",
-        Accept: "audio/mpeg",
-      },
-      body: JSON.stringify({
-        text: prepareForVoice(text),
-        model_id: "eleven_multilingual_v2",
-        voice_settings: {
-          stability: 0.42,
-          similarity_boost: 0.85,
-          style: 0.22,
-          use_speaker_boost: true,
-        },
-      }),
-    }
-  );
-
-  if (!res.ok) throw new Error(await res.text());
-  return res.buffer();
-}
-
 async function wikiSearch(query) {
   const url =
-    "https://ru.wikisource.org/w/api.php?action=query&list=search&format=json&srlimit=10&srsearch=" +
+    "https://ru.wikisource.org/w/api.php?action=query&list=search&format=json&srlimit=12&srsearch=" +
     encodeURIComponent(query);
 
   const data = await fetch(url).then((r) => r.json());
@@ -164,41 +170,29 @@ function scoreTitle(title, query) {
   const q = query.toLowerCase();
 
   let score = 0;
-
   if (t.includes(q)) score += 100;
   if (t.includes("(")) score += 30;
-  if (t.includes("/часть первая")) score += 80;
-  if (t.includes("/часть 1")) score += 80;
-  if (t.includes("/i")) score += 50;
-  if (t.includes("/глава i")) score += 50;
-  if (t.includes("/эпилог")) score -= 500;
-  if (badTitle(title)) score -= 300;
+  if (t.includes("/часть первая")) score += 100;
+  if (t.includes("/часть 1")) score += 100;
+  if (t.endsWith("/i")) score += 80;
+  if (t.includes("/глава i")) score += 80;
+  if (badTitle(t)) score -= 500;
 
   return score;
 }
 
-function sortBookLinks(links, mainTitle) {
-  return links
-    .map((l) => l["*"])
-    .filter(Boolean)
-    .filter((x) => x.startsWith(mainTitle + "/"))
-    .filter((x) => !badTitle(x))
-    .sort((a, b) => {
-      const aa = a.toLowerCase();
-      const bb = b.toLowerCase();
+function linkPriority(title) {
+  const t = title.toLowerCase();
 
-      const priority = (x) => {
-        if (x.includes("часть первая")) return 1;
-        if (x.includes("часть 1")) return 1;
-        if (x.endsWith("/i")) return 2;
-        if (x.includes("глава i")) return 2;
-        if (x.includes("часть вторая")) return 20;
-        if (x.includes("часть 2")) return 20;
-        return 10;
-      };
+  if (badTitle(t)) return 999;
+  if (t.includes("часть первая")) return 1;
+  if (t.includes("часть 1")) return 1;
+  if (t.endsWith("/i")) return 2;
+  if (t.includes("глава i")) return 2;
+  if (t.includes("часть вторая")) return 20;
+  if (t.includes("часть 2")) return 20;
 
-      return priority(aa) - priority(bb) || a.localeCompare(b, "ru");
-    });
+  return 10;
 }
 
 async function findBook(query) {
@@ -213,11 +207,17 @@ async function findBook(query) {
     const page = await getWikiPage(title);
     if (!page) continue;
 
-    if (page.text.length > 8000 && !badTitle(page.title)) {
+    if (page.text.length > 10000 && !badTitle(page.title)) {
       return { title: page.title, text: page.text };
     }
 
-    const childLinks = sortBookLinks(page.links, page.title).slice(0, 25);
+    const childLinks = page.links
+      .map((l) => l["*"])
+      .filter(Boolean)
+      .filter((x) => x.startsWith(page.title + "/"))
+      .filter((x) => !badTitle(x))
+      .sort((a, b) => linkPriority(a) - linkPriority(b) || a.localeCompare(b, "ru"))
+      .slice(0, 30);
 
     let fullText = "";
 
@@ -227,7 +227,7 @@ async function findBook(query) {
 
       fullText += "\n\n" + child.text;
 
-      if (fullText.length > 120000) break;
+      if (fullText.length > 150000) break;
     }
 
     if (fullText.length > 5000) {
@@ -238,19 +238,44 @@ async function findBook(query) {
   return null;
 }
 
-async function readBook(chatId, book) {
-  const parts = splitText(book.text, 3500);
-
+async function readBook(chatId, query) {
   sessions.set(chatId, { active: true });
+
+  await sendText(chatId, "Принял запрос. Сначала отправлю короткое вступление, затем начну чтение книги.");
+
+  const introPromise = makeVoice(
+    `Вы попросили книгу: ${query}. Я ищу текст и готовлю первую часть. Пожалуйста, подождите.`
+  );
+
+  const bookPromise = findBook(query);
+
+  try {
+    await sendAction(chatId, "upload_audio");
+    const introAudio = await introPromise;
+    await sendAudio(chatId, introAudio, "intro.mp3", "Вступление");
+  } catch (e) {
+    console.log("INTRO ERROR:", e.message);
+  }
+
+  await sendText(chatId, "Ищу и очищаю текст книги. Это может занять немного времени.");
+
+  const book = await bookPromise;
+
+  if (!book) {
+    sessions.delete(chatId);
+    await sendText(chatId, "Не нашёл нормальный текст. Попробуй точнее: название + автор.");
+    return;
+  }
+
+  const parts = splitSmart(book.text);
 
   await sendText(
     chatId,
-    `Нашёл: ${book.title}\n\nГотовлю первую аудио-часть. Подождите 20–40 секунд.\nДальше части будут приходить подряд.\n\nОстановить: /stop`
+    `Нашёл: ${book.title}\nНачинаю чтение.\nПервая часть короткая, дальше пойдут длинные части.\nОстановить: /stop`
   );
 
   for (let i = 0; i < parts.length; i++) {
     const session = sessions.get(chatId);
-
     if (!session || !session.active) {
       await sendText(chatId, "Чтение остановлено.");
       return;
@@ -258,7 +283,9 @@ async function readBook(chatId, book) {
 
     await sendAction(chatId, "upload_audio");
 
-    if (i > 0) {
+    if (i === 0) {
+      await sendText(chatId, "Готовлю первую часть...");
+    } else {
       await sendText(chatId, `Готовлю часть ${i + 1}...`);
     }
 
@@ -271,7 +298,7 @@ async function readBook(chatId, book) {
       `Часть ${i + 1} из ${parts.length}`
     );
 
-    await new Promise((r) => setTimeout(r, 1200));
+    await new Promise((r) => setTimeout(r, 300));
   }
 
   sessions.delete(chatId);
@@ -312,19 +339,7 @@ app.post("/", async (req, res) => {
       return;
     }
 
-    await sendText(chatId, "Ищу книгу в интернете. Подождите пожалуйста...");
-
-    const book = await findBook(text);
-
-    if (!book) {
-      await sendText(
-        chatId,
-        "Не нашёл нормальный текст. Попробуй точнее: название + автор.\n\nНапример:\nПреступление и наказание Достоевский"
-      );
-      return;
-    }
-
-    readBook(chatId, book).catch(async (err) => {
+    readBook(chatId, text).catch(async (err) => {
       console.log("STREAM ERROR:", err.message);
       await sendText(chatId, "Ошибка чтения:\n" + err.message);
       sessions.delete(chatId);

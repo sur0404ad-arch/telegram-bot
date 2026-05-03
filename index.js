@@ -1,7 +1,7 @@
 const express = require("express");
 const axios = require("axios");
 const FormData = require("form-data");
-const crypto = require("crypto");
+const iconv = require("iconv-lite");
 const { Pool } = require("pg");
 
 const app = express();
@@ -21,7 +21,8 @@ const pool = new Pool({
 });
 
 const controllers = {};
-const jobs = {};
+const activeJobs = {};
+const busy = new Set();
 
 app.get("/", (req, res) => res.send("SERVER RUNNING"));
 
@@ -42,45 +43,35 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     }
 
     if (text === "/stop") {
-      await stopJob(chatId);
+      await stop(chatId);
       return sendMessage(chatId, "⏹ Остановлено. Позиция сохранена.");
     }
 
     if (text === "/resume") {
-      return resumeBook(chatId);
+      await resume(chatId);
+      return sendMessage(chatId, "▶️ Продолжение включено. Напиши /next.");
     }
 
     if (text === "/next") {
-      return sendCurrentPart(chatId);
+      return sendNextPart(chatId);
     }
 
-    await stopJob(chatId);
+    await stop(chatId);
+    await sendMessage(chatId, "🔎 Готовлю русский текст...");
 
-    await sendMessage(chatId, "🔎 Ищу и готовлю книгу...");
-
-    const book = await getOrCreateBook(text);
-
-    if (!book) {
-      return sendMessage(chatId, "❌ Сейчас стабильно подключена только книга: Преступление и наказание.");
-    }
-
-    const jobId = newJob(chatId);
+    const book = await prepareCrimeAndPunishment();
 
     await saveSession(chatId, {
-      query: text,
       book_key: book.key,
       title: book.title,
       part_index: 0,
-      stopped: false,
-      job_id: jobId
+      stopped: false
     });
 
     await sendMessage(
       chatId,
-      `📖 ${book.title}\n\n🎬 Режим Netflix:\n/next — следующая часть\n/stop — остановить\n/resume — продолжить\n\nЧастей: ${book.parts.length}`
+      `📖 ${book.title}\n\nГотово.\nЧастей: ${book.parts.length}\n\n/next — слушать следующую часть\n/stop — остановить\n/resume — продолжить`
     );
-
-    return sendCurrentPart(chatId);
 
   } catch (e) {
     console.log("SERVER ERROR:", e.response?.data || e.message || e);
@@ -100,12 +91,10 @@ async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sessions (
       chat_id TEXT PRIMARY KEY,
-      query TEXT,
       book_key TEXT,
       title TEXT,
       part_index INT DEFAULT 0,
       stopped BOOLEAN DEFAULT FALSE,
-      job_id TEXT,
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
@@ -121,46 +110,11 @@ async function initDB() {
   `);
 }
 
-async function getOrCreateBook(query) {
-  const detected = detectBook(query);
-  if (!detected) return null;
-
-  const cached = await getBookByKey(detected.key);
+async function prepareCrimeAndPunishment() {
+  const key = "ru_crime_and_punishment_v3";
+  const cached = await getBookByKey(key);
   if (cached) return cached;
 
-  const text = await loadCrimeAndPunishment();
-  if (!text || text.length < 5000) return null;
-
-  const parts = splitText(text, 5000).filter(p => p.length > 1000);
-
-  await pool.query(
-    `INSERT INTO books (key, title, parts)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (key) DO UPDATE SET title=$2, parts=$3`,
-    [detected.key, detected.title, JSON.stringify(parts)]
-  );
-
-  return {
-    key: detected.key,
-    title: detected.title,
-    parts
-  };
-}
-
-function detectBook(query) {
-  const t = query.toLowerCase();
-
-  if (t.includes("преступление") || t.includes("достоевский")) {
-    return {
-      key: "ru_crime_and_punishment",
-      title: "Преступление и наказание"
-    };
-  }
-
-  return null;
-}
-
-async function loadCrimeAndPunishment() {
   let full = "";
 
   for (let i = 1; i <= 90; i++) {
@@ -168,24 +122,32 @@ async function loadCrimeAndPunishment() {
 
     try {
       const res = await axios.get(url, {
+        responseType: "arraybuffer",
         timeout: 15000,
-        responseType: "text",
         headers: { "User-Agent": "BookVoiceAI/1.0" }
       });
 
-      const clean = cleanILibrary(res.data);
+      const html = iconv.decode(Buffer.from(res.data), "win1251");
+      const text = cleanILibrary(html);
 
-      if (clean.length > 500) {
-        full += "\n\n" + clean;
-      }
-
-      if (full.length > 250000) break;
-    } catch {
+      if (text.length > 500) full += "\n\n" + text;
+      if (full.length > 260000) break;
+    } catch (e) {
+      console.log("PAGE LOAD STOP:", i, e.message);
       break;
     }
   }
 
-  return full.trim();
+  const parts = splitText(full, 5500).filter(p => p.length > 1500);
+
+  await pool.query(
+    `INSERT INTO books (key, title, parts)
+     VALUES ($1,$2,$3)
+     ON CONFLICT (key) DO UPDATE SET title=$2, parts=$3`,
+    [key, "Преступление и наказание", JSON.stringify(parts)]
+  );
+
+  return { key, title: "Преступление и наказание", parts };
 }
 
 function cleanILibrary(html) {
@@ -205,127 +167,95 @@ function cleanILibrary(html) {
     .replace(/\s+/g, " ")
     .trim();
 
-  text = text
-    .replace(/^[\s\S]*?Федор Достоевский/i, "Федор Достоевский")
-    .replace(/Читать онлайн[\s\S]*?читать/i, "")
+  const start = text.search(/Федор Достоевский|Преступление и наказание/i);
+  if (start > 0) text = text.slice(start);
+
+  return text
+    .replace(/Комментарии[\s\S]*$/i, "")
     .replace(/Все права защищены[\s\S]*$/i, "")
     .trim();
-
-  return text;
 }
 
-async function sendCurrentPart(chatId) {
+async function sendNextPart(chatId) {
+  if (busy.has(chatId)) {
+    return sendMessage(chatId, "⏳ Уже готовлю часть. Подожди.");
+  }
+
   const session = await getSession(chatId);
-
-  if (!session?.book_key) {
-    return sendMessage(chatId, "❌ Нет активной книги.");
-  }
-
-  if (session.stopped) {
-    return sendMessage(chatId, "⏸ Остановлено. Напиши /resume.");
-  }
+  if (!session?.book_key) return sendMessage(chatId, "❌ Сначала напиши название книги.");
+  if (session.stopped) return sendMessage(chatId, "⏸ Остановлено. Напиши /resume.");
 
   const book = await getBookByKey(session.book_key);
-  if (!book) return sendMessage(chatId, "❌ Книга не найдена в базе.");
+  if (!book) return sendMessage(chatId, "❌ Книга не найдена.");
 
   const index = Number(session.part_index || 0);
+  if (index >= book.parts.length) return sendMessage(chatId, "✅ Книга закончена.");
 
-  if (index >= book.parts.length) {
-    return sendMessage(chatId, "✅ Книга закончена.");
-  }
+  const jobId = `${Date.now()}_${Math.random()}`;
+  activeJobs[chatId] = jobId;
+  busy.add(chatId);
 
-  const jobId = newJob(chatId);
+  try {
+    await sendMessage(chatId, `🎙 Часть ${index + 1}/${book.parts.length}`);
 
-  await saveSession(chatId, {
-    stopped: false,
-    job_id: jobId
-  });
+    let audio = await getCachedAudio(book.key, index);
 
-  await sendMessage(chatId, `🎙 Часть ${index + 1}/${book.parts.length}`);
+    if (!audio) {
+      const controller = new AbortController();
+      controllers[chatId] = controller;
 
-  let audio = await getCachedAudio(book.key, index);
-
-  if (!audio) {
-    const controller = new AbortController();
-    controllers[chatId] = controller;
-
-    try {
       audio = await elevenLabsTTS(book.parts[index], controller.signal);
-      if (!(await isAlive(chatId, jobId))) return;
+
+      if (activeJobs[chatId] !== jobId) return;
+
       await saveAudioCache(book.key, index, audio);
-    } catch (e) {
-      if (e.name === "CanceledError" || e.code === "ERR_CANCELED") return;
-      console.log("TTS ERROR:", e.response?.data || e.message);
-      return sendMessage(chatId, "❌ Ошибка озвучки.");
-    } finally {
-      delete controllers[chatId];
     }
+
+    if (activeJobs[chatId] !== jobId) return;
+
+    await sendAudio(
+      chatId,
+      audio,
+      `part_${index + 1}.mp3`,
+      `📖 ${book.title}\nЧасть ${index + 1}/${book.parts.length}`
+    );
+
+    if (activeJobs[chatId] !== jobId) return;
+
+    await saveSession(chatId, {
+      part_index: index + 1,
+      stopped: false
+    });
+
+    await sendMessage(chatId, "▶️ Напиши /next для следующей части.");
+  } catch (e) {
+    if (e.name !== "CanceledError" && e.code !== "ERR_CANCELED") {
+      console.log("PART ERROR:", e.response?.data || e.message || e);
+      await sendMessage(chatId, "❌ Ошибка озвучки.");
+    }
+  } finally {
+    delete controllers[chatId];
+    busy.delete(chatId);
   }
-
-  if (!(await isAlive(chatId, jobId))) return;
-
-  await sendAudio(
-    chatId,
-    audio,
-    `part_${index + 1}.mp3`,
-    `📖 ${book.title}\nЧасть ${index + 1}/${book.parts.length}`
-  );
-
-  if (!(await isAlive(chatId, jobId))) return;
-
-  await saveSession(chatId, {
-    part_index: index + 1,
-    stopped: false,
-    job_id: jobId
-  });
-
-  await sendMessage(chatId, "▶️ Напиши /next для следующей части или /stop для остановки.");
 }
 
-async function resumeBook(chatId) {
-  const session = await getSession(chatId);
-
-  if (!session?.book_key) {
-    return sendMessage(chatId, "❌ Нет сохранённой книги.");
-  }
-
-  await saveSession(chatId, {
-    stopped: false,
-    job_id: newJob(chatId)
-  });
-
-  return sendCurrentPart(chatId);
-}
-
-async function stopJob(chatId) {
-  jobs[chatId] = `stopped_${Date.now()}`;
+async function stop(chatId) {
+  activeJobs[chatId] = `stopped_${Date.now()}`;
 
   if (controllers[chatId]) {
-    try {
-      controllers[chatId].abort();
-    } catch {}
+    try { controllers[chatId].abort(); } catch {}
     delete controllers[chatId];
   }
 
-  const session = await getSession(chatId);
+  busy.delete(chatId);
 
-  if (session) {
-    await saveSession(chatId, {
-      stopped: true,
-      job_id: jobs[chatId]
-    });
-  }
+  const s = await getSession(chatId);
+  if (s) await saveSession(chatId, { stopped: true });
 }
 
-function newJob(chatId) {
-  const jobId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-  jobs[chatId] = jobId;
-  return jobId;
-}
-
-async function isAlive(chatId, jobId) {
-  const session = await getSession(chatId);
-  return jobs[chatId] === jobId && session && !session.stopped && session.job_id === jobId;
+async function resume(chatId) {
+  const s = await getSession(chatId);
+  if (s) await saveSession(chatId, { stopped: false });
 }
 
 function splitText(text, maxLength) {
@@ -335,7 +265,6 @@ function splitText(text, maxLength) {
 
   for (const sentence of sentences) {
     const s = sentence.trim();
-
     if ((current + " " + s).length > maxLength) {
       if (current.trim()) parts.push(current.trim());
       current = s;
@@ -345,7 +274,6 @@ function splitText(text, maxLength) {
   }
 
   if (current.trim()) parts.push(current.trim());
-
   return parts;
 }
 
@@ -410,12 +338,10 @@ async function getBookByKey(key) {
   const r = await pool.query("SELECT * FROM books WHERE key=$1", [key]);
   if (!r.rows.length) return null;
 
-  const row = r.rows[0];
-
   return {
-    key: row.key,
-    title: row.title,
-    parts: row.parts
+    key: r.rows[0].key,
+    title: r.rows[0].title,
+    parts: r.rows[0].parts
   };
 }
 
@@ -428,20 +354,18 @@ async function saveSession(chatId, data) {
   const current = await getSession(chatId);
 
   const next = {
-    query: data.query ?? current?.query ?? null,
     book_key: data.book_key ?? current?.book_key ?? null,
     title: data.title ?? current?.title ?? null,
     part_index: data.part_index ?? current?.part_index ?? 0,
-    stopped: data.stopped ?? current?.stopped ?? false,
-    job_id: data.job_id ?? current?.job_id ?? null
+    stopped: data.stopped ?? current?.stopped ?? false
   };
 
   await pool.query(
-    `INSERT INTO sessions (chat_id, query, book_key, title, part_index, stopped, job_id, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+    `INSERT INTO sessions (chat_id, book_key, title, part_index, stopped, updated_at)
+     VALUES ($1,$2,$3,$4,$5,NOW())
      ON CONFLICT (chat_id)
-     DO UPDATE SET query=$2, book_key=$3, title=$4, part_index=$5, stopped=$6, job_id=$7, updated_at=NOW()`,
-    [chatId, next.query, next.book_key, next.title, next.part_index, next.stopped, next.job_id]
+     DO UPDATE SET book_key=$2, title=$3, part_index=$4, stopped=$5, updated_at=NOW()`,
+    [chatId, next.book_key, next.title, next.part_index, next.stopped]
   );
 }
 
@@ -451,8 +375,7 @@ async function getCachedAudio(bookKey, partIndex) {
     [bookKey, partIndex]
   );
 
-  if (!r.rows.length) return null;
-  return r.rows[0].audio;
+  return r.rows[0]?.audio || null;
 }
 
 async function saveAudioCache(bookKey, partIndex, audio) {
@@ -464,16 +387,8 @@ async function saveAudioCache(bookKey, partIndex, audio) {
   );
 }
 
-function hash(text) {
-  return crypto.createHash("sha256").update(text).digest("hex");
-}
-
 initDB()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`SERVER RUNNING ON ${PORT}`);
-    });
-  })
+  .then(() => app.listen(PORT, () => console.log(`SERVER RUNNING ON ${PORT}`)))
   .catch(err => {
     console.log("DB INIT ERROR:", err.message);
     process.exit(1);

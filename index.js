@@ -14,12 +14,10 @@ const TG_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const WIKI_API = "https://ru.wikisource.org/w/api.php";
 
 const HEADERS = {
-  "User-Agent": "BookVoiceAI/1.0 (Telegram bot; contact: book_voice_reader_bot)",
+  "User-Agent": "BookVoiceAI/1.0 TelegramBot"
 };
 
-app.get("/", (req, res) => {
-  res.send("SERVER RUNNING");
-});
+app.get("/", (req, res) => res.send("SERVER RUNNING"));
 
 app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
   res.sendStatus(200);
@@ -34,10 +32,7 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     console.log("USER MESSAGE:", userText);
 
     if (userText === "/start") {
-      await sendMessage(
-        chatId,
-        "📚 Напиши название книги.\n\nНапример:\nПреступление и наказание"
-      );
+      await sendMessage(chatId, "📚 Напиши название книги.\n\nНапример:\nПреступление и наказание");
       return;
     }
 
@@ -46,37 +41,55 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       return;
     }
 
-    await sendMessage(chatId, "🔎 Ищу в Викитеке...");
+    await sendMessage(chatId, "🔎 Ищу книгу в Викитеке...");
 
-    const page = await findWikisourcePage(userText);
+    const bookTitle = await findBookTitle(userText);
 
-    if (!page) {
+    if (!bookTitle) {
       await sendMessage(chatId, "❌ Не нашёл книгу в Викитеке.");
       return;
     }
 
-    await sendMessage(chatId, `📖 Нашёл: ${page.title}`);
-    await sendMessage(chatId, "📥 Загружаю текст...");
+    await sendMessage(chatId, `📖 Нашёл книгу:\n${bookTitle}`);
+    await sendMessage(chatId, "📚 Ищу главы...");
 
-    const rawText = await getWikisourceText(page.title);
-    const cleanText = cleanBookText(rawText);
+    const chapters = await findChapters(bookTitle);
 
-    console.log("CLEAN TEXT LENGTH:", cleanText.length);
-
-    if (cleanText.length < 700) {
-      await sendMessage(chatId, "❌ Нашёл страницу, но текста мало для озвучки.");
+    if (!chapters.length) {
+      await sendMessage(chatId, "❌ Нашёл книгу, но не нашёл главы.");
       return;
     }
 
-    const chunk = cleanText.slice(0, 1500);
+    const firstChapter = chapters[0];
 
-    await sendMessage(chatId, "🎙 Озвучиваю первую часть...");
+    await sendMessage(chatId, `🎬 Начинаю как сериал:\n\n${firstChapter}`);
 
-    const audioBuffer = await elevenLabsTTS(narrationText(chunk));
+    const chapterText = await getPageExtract(firstChapter);
+    const clean = cleanText(chapterText);
 
-    await sendAudio(chatId, audioBuffer, "part_1.mp3", `📚 ${page.title}\nЧасть 1`);
+    console.log("CHAPTER TEXT LENGTH:", clean.length);
 
-    await sendMessage(chatId, "✅ Готово.");
+    if (clean.length < 300) {
+      await sendMessage(chatId, "❌ Глава найдена, но текста мало.");
+      return;
+    }
+
+    const chunks = splitText(clean, 1600).slice(0, 5);
+
+    for (let i = 0; i < chunks.length; i++) {
+      await sendMessage(chatId, `🎙 Глава 1 — часть ${i + 1}/${chunks.length}`);
+
+      const audio = await elevenLabsTTS(chunks[i]);
+
+      await sendAudio(
+        chatId,
+        audio,
+        `chapter_1_part_${i + 1}.mp3`,
+        `📖 ${bookTitle}\n🎬 Глава 1\nЧасть ${i + 1}`
+      );
+    }
+
+    await sendMessage(chatId, "✅ Глава 1 отправлена. Потом сделаем кнопку «Следующая глава».");
 
   } catch (error) {
     console.log("SERVER ERROR:", error.response?.data || error.message || error);
@@ -86,47 +99,104 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
 function isBlocked(text) {
   const t = text.toLowerCase();
 
-  const blocked = [
+  return [
     "гарри поттер",
     "harry potter",
-    "rowling",
     "роулинг",
+    "rowling",
     "стивен кинг",
     "stephen king",
-    "метро 2033",
-    "лукьяненко",
     "пелевин",
-    "акунин"
-  ];
-
-  return blocked.some((x) => t.includes(x));
+    "акунин",
+    "лукьяненко",
+    "метро 2033"
+  ].some(x => t.includes(x));
 }
 
-async function findWikisourcePage(query) {
+async function findBookTitle(query) {
   const res = await axios.get(WIKI_API, {
     params: {
-      action: "opensearch",
-      search: query,
-      limit: 5,
-      namespace: 0,
-      format: "json"
+      action: "query",
+      list: "search",
+      srsearch: query,
+      format: "json",
+      srlimit: 10
     },
     headers: HEADERS,
     timeout: 15000
   });
 
-  console.log("WIKI OPENSEARCH:", JSON.stringify(res.data));
+  const results = res.data.query?.search || [];
 
-  const titles = res.data[1] || [];
+  console.log("SEARCH RESULTS:", results.map(r => r.title));
 
-  if (!titles.length) return null;
+  const good = results.find(r =>
+    !r.title.includes("Автор:") &&
+    !r.title.includes("Категория:") &&
+    !r.title.includes("Обсуждение:") &&
+    !r.title.includes("Викитека:")
+  );
 
-  return {
-    title: titles[0]
-  };
+  return good ? good.title : null;
 }
 
-async function getWikisourceText(title) {
+async function findChapters(bookTitle) {
+  const res = await axios.get(WIKI_API, {
+    params: {
+      action: "query",
+      list: "allpages",
+      apprefix: bookTitle + "/",
+      apnamespace: 0,
+      aplimit: 100,
+      format: "json"
+    },
+    headers: HEADERS,
+    timeout: 20000
+  });
+
+  const pages = res.data.query?.allpages || [];
+  let titles = pages.map(p => p.title);
+
+  titles = titles.filter(t =>
+    !t.includes("Оглавление") &&
+    !t.includes("Предисловие") &&
+    !t.includes("Примечания") &&
+    !t.includes("Комментарии")
+  );
+
+  titles.sort((a, b) => chapterNumber(a) - chapterNumber(b));
+
+  console.log("CHAPTERS:", titles);
+
+  return titles;
+}
+
+function chapterNumber(title) {
+  const lower = title.toLowerCase();
+
+  const map = {
+    "i": 1,
+    "ii": 2,
+    "iii": 3,
+    "iv": 4,
+    "v": 5,
+    "vi": 6,
+    "vii": 7,
+    "viii": 8,
+    "ix": 9,
+    "x": 10
+  };
+
+  const roman = lower.match(/\/([ivx]+)$/i);
+  if (roman && map[roman[1].toLowerCase()]) return map[roman[1].toLowerCase()];
+
+  const num = lower.match(/(\d+)/);
+  if (num) return Number(num[1]);
+
+  return 999;
+}
+
+async function getPageExtract(title) {
   const res = await axios.get(WIKI_API, {
     params: {
       action: "query",
@@ -141,14 +211,12 @@ async function getWikisourceText(title) {
   });
 
   const pages = res.data.query?.pages || {};
-  const firstPage = Object.values(pages)[0];
+  const page = Object.values(pages)[0];
 
-  console.log("RAW TEXT LENGTH:", firstPage?.extract?.length || 0);
-
-  return firstPage?.extract || "";
+  return page?.extract || "";
 }
 
-function cleanBookText(text) {
+function cleanText(text) {
   return String(text || "")
     .replace(/\r/g, "")
     .replace(/\n{3,}/g, "\n\n")
@@ -158,21 +226,27 @@ function cleanBookText(text) {
     .replace(/См. также[\s\S]*$/i, "")
     .replace(/Примечания[\s\S]*$/i, "")
     .replace(/Источники[\s\S]*$/i, "")
-    .replace(/[ \t]{2,}/g, " ")
-    .trim();
-}
-
-function cleanVoiceText(text) {
-  return String(text || "")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function narrationText(text) {
-  return cleanVoiceText(text)
-    .replace(/([.!?])\s+/g, "$1...\n\n")
-    .replace(/—/g, " — ")
-    .trim();
+function splitText(text, maxLength) {
+  const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+  const chunks = [];
+  let current = "";
+
+  for (const s of sentences) {
+    if ((current + s).length > maxLength) {
+      if (current.trim()) chunks.push(current.trim());
+      current = s;
+    } else {
+      current += " " + s;
+    }
+  }
+
+  if (current.trim()) chunks.push(current.trim());
+
+  return chunks;
 }
 
 async function elevenLabsTTS(text) {

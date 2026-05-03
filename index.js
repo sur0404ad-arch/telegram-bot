@@ -1,4 +1,4 @@
-console.log("BOOK BOT STABLE VERSION STARTED");
+console.log("BOOK BOT CLEAN VOICE VERSION STARTED");
 
 const express = require("express");
 const fetch = require("node-fetch");
@@ -13,14 +13,17 @@ const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;
 
 const sessions = new Map();
 
+function timeout(ms) {
+  return new Promise((_, reject) => {
+    setTimeout(() => reject(new Error("TIMEOUT")), ms);
+  });
+}
+
 async function sendText(chatId, text) {
   await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text
-    })
+    body: JSON.stringify({ chat_id: chatId, text })
   });
 }
 
@@ -28,10 +31,7 @@ async function sendAction(chatId) {
   await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      action: "upload_audio"
-    })
+    body: JSON.stringify({ chat_id: chatId, action: "upload_audio" })
   });
 }
 
@@ -44,21 +44,17 @@ async function sendAudio(chatId, buffer, filename, caption) {
     contentType: "audio/mpeg"
   });
 
-  if (caption) {
-    form.append("caption", caption);
-  }
+  if (caption) form.append("caption", caption);
 
-  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendAudio`, {
+  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendAudio`, {
     method: "POST",
     headers: form.getHeaders(),
     body: form
   });
-}
 
-function timeout(ms) {
-  return new Promise((_, reject) => {
-    setTimeout(() => reject(new Error("TIMEOUT")), ms);
-  });
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
 }
 
 function cleanHtml(html) {
@@ -87,22 +83,20 @@ function cleanVoiceText(text) {
 }
 
 function narrationText(text) {
-  const t = cleanVoiceText(text)
+  return cleanVoiceText(text)
     .replace(/([.!?])\s+/g, "$1...\n\n")
     .replace(/—/g, " — ")
     .trim();
-
-  return `Читай как профессиональный диктор аудиокниги. Тёплый мужской голос. Медленно. Спокойно. С паузами.\n\n${t}`;
 }
 
 function splitParts(text) {
   const clean = cleanVoiceText(text);
   const parts = [];
-
   let rest = clean;
 
   while (rest.length > 0 && parts.length < 8) {
     let part = rest.slice(0, 1800);
+
     const cut = Math.max(
       part.lastIndexOf("."),
       part.lastIndexOf("!"),
@@ -117,7 +111,7 @@ function splitParts(text) {
     rest = rest.slice(part.length).trim();
   }
 
-  return parts.filter(p => p.length > 80);
+  return parts.filter((p) => p.length > 80);
 }
 
 async function makeVoice(text) {
@@ -127,7 +121,7 @@ async function makeVoice(text) {
       headers: {
         "xi-api-key": ELEVEN_API_KEY,
         "Content-Type": "application/json",
-        "Accept": "audio/mpeg"
+        Accept: "audio/mpeg"
       },
       body: JSON.stringify({
         text: narrationText(text),
@@ -167,11 +161,11 @@ async function wikiSearch(query) {
     encodeURIComponent(query);
 
   const data = await Promise.race([
-    fetch(url).then(r => r.json()),
+    fetch(url).then((r) => r.json()),
     timeout(12000)
   ]);
 
-  return data?.query?.search?.map(x => x.title) || [];
+  return data?.query?.search?.map((x) => x.title) || [];
 }
 
 async function getWikiPage(title) {
@@ -180,7 +174,7 @@ async function getWikiPage(title) {
     encodeURIComponent(title);
 
   const data = await Promise.race([
-    fetch(url).then(r => r.json()),
+    fetch(url).then((r) => r.json()),
     timeout(12000)
   ]);
 
@@ -196,12 +190,15 @@ async function findBook(query) {
   const titles = await wikiSearch(query);
 
   for (const title of titles) {
-    const bad =
-      title.toLowerCase().includes("обсуждение") ||
-      title.toLowerCase().includes("категория") ||
-      title.toLowerCase().includes("автор:");
+    const lower = title.toLowerCase();
 
-    if (bad) continue;
+    if (
+      lower.includes("обсуждение") ||
+      lower.includes("категория") ||
+      lower.includes("автор:")
+    ) {
+      continue;
+    }
 
     const page = await getWikiPage(title);
 
@@ -219,7 +216,7 @@ async function readBook(chatId, query) {
   if (isModernCopyrightRisk(query)) {
     await sendText(
       chatId,
-      "Эта книга, скорее всего, защищена авторским правом. Я могу читать только легальные открытые тексты. Попробуй: Преступление и наказание Достоевский, Капитанская дочка Пушкин, Шинель Гоголь."
+      "Эта книга, скорее всего, защищена авторским правом. Я могу читать только легальные открытые тексты.\n\nПопробуй:\nПреступление и наказание Достоевский\nКапитанская дочка Пушкин\nШинель Гоголь"
     );
     sessions.delete(chatId);
     return;
@@ -282,7 +279,7 @@ app.post("/", async (req, res) => {
     if (text === "/start") {
       await sendText(
         chatId,
-        "Напиши название книги и автора. Например: Преступление и наказание Достоевский"
+        "Напиши название книги и автора.\nНапример: Преступление и наказание Достоевский"
       );
       return;
     }
@@ -300,7 +297,7 @@ app.post("/", async (req, res) => {
       return;
     }
 
-    readBook(chatId, text).catch(async err => {
+    readBook(chatId, text).catch(async (err) => {
       console.log("READ ERROR:", err.message);
       sessions.delete(chatId);
       await sendText(chatId, "Ошибка чтения:\n" + err.message);
@@ -313,6 +310,6 @@ app.post("/", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log("BOOK BOT STABLE VERSION STARTED");
+  console.log("BOOK BOT CLEAN VOICE VERSION STARTED");
   console.log("SERVER RUNNING ON " + PORT);
 });

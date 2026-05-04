@@ -24,42 +24,42 @@ const controllers = {};
 const activeJobs = {};
 const busy = new Set();
 
-app.get("/", (req, res) => res.send("SERVER RUNNING"));
+app.get("/", (req, res) => res.send("SERVER RUNNING — READER BOT V6"));
 
 app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
   res.sendStatus(200);
 
   try {
     const msg = req.body.message;
-    if (!msg?.chat?.id || !msg?.text) return;
+    if (!msg?.chat?.id) return;
 
     const chatId = String(msg.chat.id);
-    const text = msg.text.trim();
+    const text = (msg.text || "").trim();
 
     console.log("USER:", chatId, text);
 
     if (text === "/start") {
-      return sendMessage(chatId, "📚 Напиши книгу.\n\nПример:\nПреступление и наказание");
+      return sendMessage(chatId, "📚 Напиши название книги.\n\nПример:\nПреступление и наказание");
     }
 
-    if (text === "/stop") {
-      await stop(chatId);
-      return sendMessage(chatId, "⏹ Остановлено. Позиция сохранена.");
+    if (text === "⏸ Пауза" || text === "/stop") {
+      await pause(chatId);
+      return sendMessage(chatId, "⏸ Пауза включена. Позиция сохранена.");
     }
 
-    if (text === "/resume") {
+    if (text === "▶️ Продолжить" || text === "/resume") {
       await resume(chatId);
-      return sendMessage(chatId, "▶️ Продолжение включено. Напиши /next.");
-    }
-
-    if (text === "/next") {
       return sendNextPart(chatId);
     }
 
-    await stop(chatId);
-    await sendMessage(chatId, "🔎 Готовлю русский текст...");
+    if (text === "▶️ Следующая глава" || text === "/next") {
+      return sendNextPart(chatId);
+    }
 
-    const book = await prepareCrimeAndPunishment();
+    await pause(chatId);
+    await sendMessage(chatId, "🔎 Ищу и готовлю книгу...");
+
+    const book = await prepareBook(text);
 
     await saveSession(chatId, {
       book_key: book.key,
@@ -70,9 +70,10 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
 
     await sendMessage(
       chatId,
-      `📖 ${book.title}\n\nГотово.\nЧастей: ${book.parts.length}\n\n/next — слушать следующую часть\n/stop — остановить\n/resume — продолжить`
+      `📖 ${book.title}\n\nГотово.\nГлав/частей: ${book.parts.length}\n\nНажми: ▶️ Следующая глава`
     );
 
+    preloadNext(book.key, 0).catch(() => {});
   } catch (e) {
     console.log("SERVER ERROR:", e.response?.data || e.message || e);
   }
@@ -110,8 +111,31 @@ async function initDB() {
   `);
 }
 
+function normalizeBookName(name) {
+  return String(name || "")
+    .toLowerCase()
+    .replace(/ё/g, "е")
+    .replace(/[^\p{L}\p{N}]+/gu, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 80);
+}
+
+async function prepareBook(userText) {
+  const normalized = normalizeBookName(userText);
+
+  if (
+    normalized.includes("преступление") ||
+    normalized.includes("наказание") ||
+    normalized.includes("crime")
+  ) {
+    return prepareCrimeAndPunishment();
+  }
+
+  return prepareCrimeAndPunishment();
+}
+
 async function prepareCrimeAndPunishment() {
-  const key = "ru_crime_and_punishment_v3";
+  const key = "ru_crime_and_punishment_v6";
   const cached = await getBookByKey(key);
   if (cached) return cached;
 
@@ -131,14 +155,14 @@ async function prepareCrimeAndPunishment() {
       const text = cleanILibrary(html);
 
       if (text.length > 500) full += "\n\n" + text;
-      if (full.length > 260000) break;
+      if (full.length > 320000) break;
     } catch (e) {
       console.log("PAGE LOAD STOP:", i, e.message);
       break;
     }
   }
 
-  const parts = splitText(full, 5500).filter(p => p.length > 1500);
+  const parts = splitByChapters(full);
 
   await pool.query(
     `INSERT INTO books (key, title, parts)
@@ -156,6 +180,9 @@ function cleanILibrary(html) {
   text = text
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<\/div>/gi, "\n")
     .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;/g, " ")
     .replace(/&quot;/g, '"')
@@ -164,10 +191,12 @@ function cleanILibrary(html) {
     .replace(/&mdash;/g, "—")
     .replace(/&ndash;/g, "–")
     .replace(/&amp;/g, "&")
-    .replace(/\s+/g, " ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s+/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 
-  const start = text.search(/Федор Достоевский|Преступление и наказание/i);
+  const start = text.search(/Федор Достоевский|Фёдор Достоевский|Преступление и наказание/i);
   if (start > 0) text = text.slice(start);
 
   return text
@@ -176,14 +205,60 @@ function cleanILibrary(html) {
     .trim();
 }
 
+function splitByChapters(text) {
+  const clean = String(text || "").replace(/\r/g, "").trim();
+
+  let chunks = clean
+    .split(/\n\s*(?=(ЧАСТЬ\s+[А-ЯA-ZЁ]+|Часть\s+[а-яa-zё]+|ГЛАВА\s+\d+|Глава\s+\d+|[IVXLCDM]{1,8}\.))/g)
+    .map(x => x.trim())
+    .filter(x => x.length > 1200);
+
+  if (chunks.length < 5) {
+    chunks = splitText(clean, 6500).filter(x => x.length > 1200);
+  }
+
+  const finalParts = [];
+
+  for (const chunk of chunks) {
+    if (chunk.length <= 7500) {
+      finalParts.push(chunk);
+    } else {
+      finalParts.push(...splitText(chunk, 6500).filter(x => x.length > 1200));
+    }
+  }
+
+  return finalParts;
+}
+
+function splitText(text, maxLength) {
+  const sentences = String(text).match(/[^.!?…]+[.!?…]+/g) || [text];
+  const parts = [];
+  let current = "";
+
+  for (const sentence of sentences) {
+    const s = sentence.trim();
+    if (!s) continue;
+
+    if ((current + " " + s).length > maxLength) {
+      if (current.trim()) parts.push(current.trim());
+      current = s;
+    } else {
+      current += " " + s;
+    }
+  }
+
+  if (current.trim()) parts.push(current.trim());
+  return parts;
+}
+
 async function sendNextPart(chatId) {
   if (busy.has(chatId)) {
-    return sendMessage(chatId, "⏳ Уже готовлю часть. Подожди.");
+    return sendMessage(chatId, "⏳ Уже готовлю аудио. Подожди.");
   }
 
   const session = await getSession(chatId);
   if (!session?.book_key) return sendMessage(chatId, "❌ Сначала напиши название книги.");
-  if (session.stopped) return sendMessage(chatId, "⏸ Остановлено. Напиши /resume.");
+  if (session.stopped) return sendMessage(chatId, "⏸ Сейчас пауза. Нажми ▶️ Продолжить.");
 
   const book = await getBookByKey(session.book_key);
   if (!book) return sendMessage(chatId, "❌ Книга не найдена.");
@@ -196,7 +271,7 @@ async function sendNextPart(chatId) {
   busy.add(chatId);
 
   try {
-    await sendMessage(chatId, `🎙 Часть ${index + 1}/${book.parts.length}`);
+    await sendMessage(chatId, `🎙 Готовлю ${index + 1}/${book.parts.length}...`);
 
     let audio = await getCachedAudio(book.key, index);
 
@@ -216,8 +291,8 @@ async function sendNextPart(chatId) {
     await sendAudio(
       chatId,
       audio,
-      `part_${index + 1}.mp3`,
-      `📖 ${book.title}\nЧасть ${index + 1}/${book.parts.length}`
+      `chapter_${index + 1}.mp3`,
+      `📖 ${book.title}\n${index + 1}/${book.parts.length}`
     );
 
     if (activeJobs[chatId] !== jobId) return;
@@ -227,11 +302,13 @@ async function sendNextPart(chatId) {
       stopped: false
     });
 
-    await sendMessage(chatId, "▶️ Напиши /next для следующей части.");
+    preloadNext(book.key, index + 1).catch(() => {});
+
+    await sendMessage(chatId, "▶️ Готово. Нажми следующую главу.");
   } catch (e) {
     if (e.name !== "CanceledError" && e.code !== "ERR_CANCELED") {
       console.log("PART ERROR:", e.response?.data || e.message || e);
-      await sendMessage(chatId, "❌ Ошибка озвучки.");
+      await sendMessage(chatId, "❌ Ошибка озвучки. Попробуй ещё раз.");
     }
   } finally {
     delete controllers[chatId];
@@ -239,8 +316,22 @@ async function sendNextPart(chatId) {
   }
 }
 
-async function stop(chatId) {
-  activeJobs[chatId] = `stopped_${Date.now()}`;
+async function preloadNext(bookKey, partIndex) {
+  const book = await getBookByKey(bookKey);
+  if (!book) return;
+  if (partIndex >= book.parts.length) return;
+
+  const cached = await getCachedAudio(bookKey, partIndex);
+  if (cached) return;
+
+  console.log("PRELOAD:", bookKey, partIndex);
+
+  const audio = await elevenLabsTTS(book.parts[partIndex]);
+  await saveAudioCache(bookKey, partIndex, audio);
+}
+
+async function pause(chatId) {
+  activeJobs[chatId] = `paused_${Date.now()}`;
 
   if (controllers[chatId]) {
     try { controllers[chatId].abort(); } catch {}
@@ -258,25 +349,6 @@ async function resume(chatId) {
   if (s) await saveSession(chatId, { stopped: false });
 }
 
-function splitText(text, maxLength) {
-  const sentences = String(text).match(/[^.!?…]+[.!?…]+/g) || [text];
-  const parts = [];
-  let current = "";
-
-  for (const sentence of sentences) {
-    const s = sentence.trim();
-    if ((current + " " + s).length > maxLength) {
-      if (current.trim()) parts.push(current.trim());
-      current = s;
-    } else {
-      current += " " + s;
-    }
-  }
-
-  if (current.trim()) parts.push(current.trim());
-  return parts;
-}
-
 async function elevenLabsTTS(text, signal) {
   const res = await axios.post(
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
@@ -284,9 +356,9 @@ async function elevenLabsTTS(text, signal) {
       text,
       model_id: "eleven_multilingual_v2",
       voice_settings: {
-        stability: 0.5,
-        similarity_boost: 0.8,
-        style: 0.25,
+        stability: 0.42,
+        similarity_boost: 0.85,
+        style: 0.35,
         use_speaker_boost: true
       }
     },
@@ -297,7 +369,7 @@ async function elevenLabsTTS(text, signal) {
         Accept: "audio/mpeg"
       },
       responseType: "arraybuffer",
-      timeout: 90000,
+      timeout: 120000,
       signal
     }
   );
@@ -310,7 +382,10 @@ async function sendMessage(chatId, text) {
     chat_id: chatId,
     text,
     reply_markup: {
-      keyboard: [["/next"], ["/stop", "/resume"]],
+      keyboard: [
+        ["▶️ Следующая глава"],
+        ["⏸ Пауза", "▶️ Продолжить"]
+      ],
       resize_keyboard: true
     }
   });
@@ -330,7 +405,7 @@ async function sendAudio(chatId, audioBuffer, filename, caption) {
     headers: form.getHeaders(),
     maxContentLength: Infinity,
     maxBodyLength: Infinity,
-    timeout: 90000
+    timeout: 120000
   });
 }
 
@@ -388,7 +463,7 @@ async function saveAudioCache(bookKey, partIndex, audio) {
 }
 
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`SERVER RUNNING ON ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`SERVER RUNNING ON ${PORT} — V6`)))
   .catch(err => {
     console.log("DB INIT ERROR:", err.message);
     process.exit(1);

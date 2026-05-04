@@ -24,7 +24,7 @@ const controllers = {};
 const activeJobs = {};
 const busy = new Set();
 
-app.get("/", (req, res) => res.send("SERVER RUNNING — READER BOT V6"));
+app.get("/", (req, res) => res.send("SERVER RUNNING — READER BOT V7"));
 
 app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
   res.sendStatus(200);
@@ -42,9 +42,9 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       return sendMessage(chatId, "📚 Напиши название книги.\n\nПример:\nПреступление и наказание");
     }
 
-    if (text === "⏸ Пауза" || text === "/stop") {
+    if (text === "⏸ Пауза бота" || text === "/stop") {
       await pause(chatId);
-      return sendMessage(chatId, "⏸ Пауза включена. Позиция сохранена.");
+      return sendMessage(chatId, "⏸ Бот поставлен на паузу.\n\nВажно: уже отправленный mp3 останавливается кнопкой паузы в Telegram.");
     }
 
     if (text === "▶️ Продолжить" || text === "/resume") {
@@ -57,7 +57,7 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     }
 
     await pause(chatId);
-    await sendMessage(chatId, "🔎 Ищу и готовлю книгу...");
+    await sendMessage(chatId, "🔎 Ищу книгу и готовлю первую главу...");
 
     const book = await prepareBook(text);
 
@@ -70,10 +70,10 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
 
     await sendMessage(
       chatId,
-      `📖 ${book.title}\n\nГотово.\nГлав/частей: ${book.parts.length}\n\nНажми: ▶️ Следующая глава`
+      `📖 ${book.title}\n\nГотово.\nГлав/частей: ${book.parts.length}\n\n▶️ Запускаю первую главу автоматически...`
     );
 
-    preloadNext(book.key, 0).catch(() => {});
+    return sendNextPart(chatId);
   } catch (e) {
     console.log("SERVER ERROR:", e.response?.data || e.message || e);
   }
@@ -135,7 +135,7 @@ async function prepareBook(userText) {
 }
 
 async function prepareCrimeAndPunishment() {
-  const key = "ru_crime_and_punishment_v6";
+  const key = "ru_crime_and_punishment_v7";
   const cached = await getBookByKey(key);
   if (cached) return cached;
 
@@ -271,7 +271,7 @@ async function sendNextPart(chatId) {
   busy.add(chatId);
 
   try {
-    await sendMessage(chatId, `🎙 Готовлю ${index + 1}/${book.parts.length}...`);
+    await sendMessage(chatId, `🎙 Готовлю главу ${index + 1}/${book.parts.length}...`);
 
     let audio = await getCachedAudio(book.key, index);
 
@@ -292,7 +292,7 @@ async function sendNextPart(chatId) {
       chatId,
       audio,
       `chapter_${index + 1}.mp3`,
-      `📖 ${book.title}\n${index + 1}/${book.parts.length}`
+      `📖 ${book.title}\nГлава ${index + 1}/${book.parts.length}`
     );
 
     if (activeJobs[chatId] !== jobId) return;
@@ -302,9 +302,14 @@ async function sendNextPart(chatId) {
       stopped: false
     });
 
-    preloadNext(book.key, index + 1).catch(() => {});
+    const freshSession = await getSession(chatId);
+    if (!freshSession?.stopped) {
+      preloadNext(book.key, index + 1).catch(err => {
+        console.log("PRELOAD ERROR:", err.message);
+      });
+    }
 
-    await sendMessage(chatId, "▶️ Готово. Нажми следующую главу.");
+    await sendMessage(chatId, "▶️ Глава отправлена. Можешь нажать следующую главу.");
   } catch (e) {
     if (e.name !== "CanceledError" && e.code !== "ERR_CANCELED") {
       console.log("PART ERROR:", e.response?.data || e.message || e);
@@ -384,7 +389,7 @@ async function sendMessage(chatId, text) {
     reply_markup: {
       keyboard: [
         ["▶️ Следующая глава"],
-        ["⏸ Пауза", "▶️ Продолжить"]
+        ["⏸ Пауза бота", "▶️ Продолжить"]
       ],
       resize_keyboard: true
     }
@@ -463,7 +468,7 @@ async function saveAudioCache(bookKey, partIndex, audio) {
 }
 
 initDB()
-  .then(() => app.listen(PORT, () => console.log(`SERVER RUNNING ON ${PORT} — V6`)))
+  .then(() => app.listen(PORT, () => console.log(`SERVER RUNNING ON ${PORT} — V7`)))
   .catch(err => {
     console.log("DB INIT ERROR:", err.message);
     process.exit(1);

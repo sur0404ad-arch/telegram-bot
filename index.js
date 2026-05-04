@@ -1,3 +1,5 @@
+// ===== V10 STREAM-LIKE AUDIO (SEGMENTS) =====
+
 const express = require("express");
 const axios = require("axios");
 const FormData = require("form-data");
@@ -24,409 +26,190 @@ const controllers = {};
 const activeJobs = {};
 const busy = new Set();
 
-const BOOK_KEY = "ru_crime_and_punishment_v9_real_chapters_safe_tts";
+const BOOK_KEY = "crime_v10_segments";
 const BOOK_TITLE = "Преступление и наказание";
 
-app.get("/", (req, res) => res.send("SERVER RUNNING — READER BOT V9"));
+// =================== WEBHOOK ===================
 
 app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
   res.sendStatus(200);
 
-  try {
-    const msg = req.body.message;
-    if (!msg?.chat?.id) return;
+  const msg = req.body.message;
+  if (!msg?.chat?.id) return;
 
-    const chatId = String(msg.chat.id);
-    const text = (msg.text || "").trim();
+  const chatId = String(msg.chat.id);
+  const text = (msg.text || "").trim();
 
-    console.log("USER:", chatId, text);
+  console.log("USER:", chatId, text);
 
-    if (text === "/start") {
-      return sendMessage(chatId, "📚 Напиши название книги.\n\nПример:\nПреступление и наказание");
-    }
-
-    if (text === "/stop" || text === "⏸ Пауза бота") {
-      await pause(chatId);
-      return sendMessage(chatId, "⏸ Бот остановлен.\n\nУже отправленное аудио останавливается кнопкой паузы в Telegram.");
-    }
-
-    if (text === "/resume" || text === "▶️ Продолжить") {
-      await resume(chatId);
-      return sendNextChapter(chatId);
-    }
-
-    if (text === "/next" || text === "▶️ Следующая глава") {
-      return sendNextChapter(chatId);
-    }
-
-    await pause(chatId);
-    await sendMessage(chatId, "🔎 Ищу книгу и готовлю главы...");
-
-    const book = await prepareBook(text);
-
-    await saveSession(chatId, {
-      book_key: book.key,
-      title: book.title,
-      part_index: 0,
-      stopped: false
-    });
-
-    await sendMessage(
-      chatId,
-      `📖 ${book.title}\n\nГотово.\nГлав: ${book.parts.length}\n\n▶️ Запускаю первую главу автоматически...`
-    );
-
-    return sendNextChapter(chatId);
-  } catch (e) {
-    console.log("SERVER ERROR:", e.response?.data || e.message || e);
+  if (text === "/start") {
+    return sendMessage(chatId, "📚 Напиши книгу");
   }
+
+  if (text === "/stop") {
+    await stop(chatId);
+    return sendMessage(chatId, "⏸ Остановлено");
+  }
+
+  if (text === "/next") {
+    return sendNext(chatId);
+  }
+
+  await stop(chatId);
+  await sendMessage(chatId, "🔎 Готовлю книгу...");
+
+  const book = await prepareBook();
+
+  await saveSession(chatId, {
+    book_key: book.key,
+    part_index: 0,
+    segment_index: 0,
+    stopped: false
+  });
+
+  sendNext(chatId);
 });
 
-async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS books (
-      key TEXT PRIMARY KEY,
-      title TEXT NOT NULL,
-      parts JSONB NOT NULL,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
+// =================== BOOK ===================
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS sessions (
-      chat_id TEXT PRIMARY KEY,
-      book_key TEXT,
-      title TEXT,
-      part_index INT DEFAULT 0,
-      stopped BOOLEAN DEFAULT FALSE,
-      updated_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS audio_cache (
-      book_key TEXT NOT NULL,
-      part_index INT NOT NULL,
-      audio BYTEA NOT NULL,
-      created_at TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY (book_key, part_index)
-    );
-  `);
-}
-
-function normalizeBookName(name) {
-  return String(name || "")
-    .toLowerCase()
-    .replace(/ё/g, "е")
-    .replace(/[^\p{L}\p{N}]+/gu, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 80);
-}
-
-async function prepareBook(userText) {
-  const normalized = normalizeBookName(userText);
-
-  if (
-    normalized.includes("преступление") ||
-    normalized.includes("наказание") ||
-    normalized.includes("crime")
-  ) {
-    return prepareCrimeAndPunishment();
-  }
-
-  return prepareCrimeAndPunishment();
-}
-
-async function prepareCrimeAndPunishment() {
+async function prepareBook() {
   const cached = await getBookByKey(BOOK_KEY);
   if (cached) return cached;
 
-  const pages = [];
+  let full = "";
 
-  for (let i = 1; i <= 90; i++) {
+  for (let i = 1; i <= 60; i++) {
     const url = `https://ilibrary.ru/text/69/p.${i}/index.html`;
 
-    try {
-      const res = await axios.get(url, {
-        responseType: "arraybuffer",
-        timeout: 15000,
-        headers: { "User-Agent": "BookVoiceAI/1.0" }
-      });
+    const res = await axios.get(url, { responseType: "arraybuffer" });
+    const html = iconv.decode(Buffer.from(res.data), "win1251");
 
-      const html = iconv.decode(Buffer.from(res.data), "win1251");
-      const text = cleanILibrary(html);
+    const text = html
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
 
-      if (text.length > 900) {
-        pages.push({
-          title: detectTitle(text, pages.length + 1),
-          text: removeTitleNoise(text)
-        });
-      }
-    } catch (e) {
-      console.log("PAGE LOAD STOP:", i, e.message);
-      break;
-    }
+    full += "\n\n" + text;
   }
 
-  const parts = pages
-    .filter(p => p.text && p.text.length > 800)
-    .map((p, i) => ({
-      title: p.title || `Глава ${i + 1}`,
-      text: p.text
-    }));
+  const chapters = splitChapters(full);
 
   await pool.query(
     `INSERT INTO books (key, title, parts)
      VALUES ($1,$2,$3)
-     ON CONFLICT (key) DO UPDATE SET title=$2, parts=$3`,
-    [BOOK_KEY, BOOK_TITLE, JSON.stringify(parts)]
+     ON CONFLICT (key) DO UPDATE SET parts=$3`,
+    [BOOK_KEY, BOOK_TITLE, JSON.stringify(chapters)]
   );
 
-  return { key: BOOK_KEY, title: BOOK_TITLE, parts };
+  return { key: BOOK_KEY, title: BOOK_TITLE, parts: chapters };
 }
 
-function cleanILibrary(html) {
-  let text = String(html || "");
+function splitChapters(text) {
+  const raw = text.split(/ГЛАВА|Глава/g);
 
-  text = text
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n")
-    .replace(/<\/div>/gi, "\n")
-    .replace(/<\/h1>/gi, "\n")
-    .replace(/<\/h2>/gi, "\n")
-    .replace(/<\/h3>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&quot;/g, '"')
-    .replace(/&laquo;/g, "«")
-    .replace(/&raquo;/g, "»")
-    .replace(/&mdash;/g, "—")
-    .replace(/&ndash;/g, "–")
-    .replace(/&amp;/g, "&")
-    .replace(/&#769;/g, "")
-    .replace(/&#39;/g, "'")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n\s+/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-
-  const start = text.search(/Федор Достоевский|Фёдор Достоевский|Преступление и наказание|ЧАСТЬ|ГЛАВА|I\.|II\.|III\.|IV\.|V\.|VI\./i);
-  if (start > 0) text = text.slice(start);
-
-  return text
-    .replace(/Комментарии[\s\S]*$/i, "")
-    .replace(/Все права защищены[\s\S]*$/i, "")
-    .trim();
+  return raw
+    .map((t, i) => ({
+      title: `Глава ${i + 1}`,
+      segments: splitSegments(t)
+    }))
+    .filter(x => x.segments.length);
 }
 
-function detectTitle(text, number) {
-  const lines = String(text || "")
-    .split("\n")
-    .map(x => x.trim())
-    .filter(Boolean)
-    .slice(0, 20);
+function splitSegments(text) {
+  const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
 
-  let part = "";
-  let chapter = "";
-
-  for (const line of lines) {
-    if (/^ЧАСТЬ\s+/i.test(line) || /^Часть\s+/i.test(line)) part = line;
-    if (/^(ГЛАВА|Глава)\s+/i.test(line)) {
-      chapter = line;
-      break;
-    }
-    if (/^[IVXLCDM]{1,8}\.$/.test(line)) {
-      chapter = `Глава ${line}`;
-      break;
-    }
-  }
-
-  if (part && chapter) return `${part}. ${chapter}`;
-  if (chapter) return chapter;
-  if (part) return `${part}. Глава ${number}`;
-  return `Глава ${number}`;
-}
-
-function removeTitleNoise(text) {
-  return String(text || "")
-    .replace(/Федор Достоевский/gi, "")
-    .replace(/Фёдор Достоевский/gi, "")
-    .replace(/Преступление и наказание/gi, "")
-    .replace(/^ЧАСТЬ\s+[^\n]+\n?/i, "")
-    .replace(/^Часть\s+[^\n]+\n?/i, "")
-    .replace(/^ГЛАВА\s+[^\n]+\n?/i, "")
-    .replace(/^Глава\s+[^\n]+\n?/i, "")
-    .replace(/^[IVXLCDM]{1,8}\.\s*/i, "")
-    .trim();
-}
-
-async function sendNextChapter(chatId) {
-  if (busy.has(chatId)) {
-    return sendMessage(chatId, "⏳ Уже готовлю главу. Подожди.");
-  }
-
-  const session = await getSession(chatId);
-  if (!session?.book_key) return sendMessage(chatId, "❌ Сначала напиши название книги.");
-  if (session.stopped) return sendMessage(chatId, "⏸ Сейчас пауза. Нажми ▶️ Продолжить.");
-
-  const book = await getBookByKey(session.book_key);
-  if (!book) return sendMessage(chatId, "❌ Книга не найдена.");
-
-  const index = Number(session.part_index || 0);
-  if (index >= book.parts.length) return sendMessage(chatId, "✅ Книга закончена.");
-
-  const chapter = normalizeChapter(book.parts[index]);
-  const jobId = `${Date.now()}_${Math.random()}`;
-
-  activeJobs[chatId] = jobId;
-  busy.add(chatId);
-
-  try {
-    await sendMessage(chatId, `🎙 ${chapter.title}\n${index + 1}/${book.parts.length}\n\nГотовлю аудио...`);
-
-    let audio = await getCachedAudio(book.key, index);
-
-    if (!audio) {
-      const controller = new AbortController();
-      controllers[chatId] = controller;
-
-      audio = await buildAudioFromChunks(chatId, jobId, chapter.text, controller.signal);
-
-      if (activeJobs[chatId] !== jobId) return;
-
-      await saveAudioCache(book.key, index, audio);
-    }
-
-    if (activeJobs[chatId] !== jobId) return;
-
-    await sendAudio(
-      chatId,
-      audio,
-      `chapter_${index + 1}.mp3`,
-      `📖 ${book.title}\n${chapter.title}\n${index + 1}/${book.parts.length}`
-    );
-
-    if (activeJobs[chatId] !== jobId) return;
-
-    await saveSession(chatId, {
-      part_index: index + 1,
-      stopped: false
-    });
-
-    await sendMessage(chatId, "▶️ Глава отправлена. Нажми следующую главу.");
-  } catch (e) {
-    if (e.name !== "CanceledError" && e.code !== "ERR_CANCELED") {
-      console.log("CHAPTER ERROR:", e.response?.data || e.message || e);
-      await sendMessage(chatId, "❌ Ошибка озвучки. Попробуй ещё раз.");
-    }
-  } finally {
-    delete controllers[chatId];
-    busy.delete(chatId);
-  }
-}
-
-function normalizeChapter(part) {
-  if (typeof part === "string") {
-    return { title: "Глава", text: part };
-  }
-
-  return {
-    title: part.title || "Глава",
-    text: part.text || ""
-  };
-}
-
-async function buildAudioFromChunks(chatId, jobId, text, signal) {
-  const chunks = splitForTTS(text, 2300);
-  const buffers = [];
-
-  for (let i = 0; i < chunks.length; i++) {
-    if (activeJobs[chatId] !== jobId) {
-      throw new Error("Canceled by user");
-    }
-
-    const audio = await elevenLabsTTS(chunks[i], signal);
-    buffers.push(audio);
-  }
-
-  return Buffer.concat(buffers);
-}
-
-function splitForTTS(text, maxLength) {
-  const clean = String(text || "")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  const sentences = clean.match(/[^.!?…]+[.!?…]+/g) || [clean];
-  const chunks = [];
+  const segments = [];
   let current = "";
 
-  for (const sentence of sentences) {
-    const s = sentence.trim();
-    if (!s) continue;
-
-    if ((current + " " + s).length > maxLength) {
-      if (current.trim()) chunks.push(current.trim());
+  for (const s of sentences) {
+    if ((current + s).length > 2000) {
+      segments.push(current);
       current = s;
     } else {
       current += " " + s;
     }
   }
 
-  if (current.trim()) chunks.push(current.trim());
+  if (current) segments.push(current);
 
-  return chunks.filter(x => x.length > 20);
+  return segments.filter(x => x.length > 50);
 }
 
-async function pause(chatId) {
-  activeJobs[chatId] = `paused_${Date.now()}`;
+// =================== PLAY ===================
 
-  if (controllers[chatId]) {
-    try { controllers[chatId].abort(); } catch {}
-    delete controllers[chatId];
+async function sendNext(chatId) {
+  if (busy.has(chatId)) return;
+
+  const session = await getSession(chatId);
+  if (!session || session.stopped) return;
+
+  const book = await getBookByKey(session.book_key);
+  const chapter = book.parts[session.part_index];
+
+  if (!chapter) return sendMessage(chatId, "✅ Конец");
+
+  const segment = chapter.segments[session.segment_index];
+
+  if (!segment) {
+    await saveSession(chatId, {
+      part_index: session.part_index + 1,
+      segment_index: 0
+    });
+    return sendNext(chatId);
   }
 
-  busy.delete(chatId);
+  busy.add(chatId);
 
-  const s = await getSession(chatId);
-  if (s) await saveSession(chatId, { stopped: true });
+  const jobId = Date.now();
+  activeJobs[chatId] = jobId;
+
+  try {
+    const audio = await tts(segment);
+
+    if (activeJobs[chatId] !== jobId) return;
+
+    await sendAudio(chatId, audio, `seg.mp3`, `${chapter.title}`);
+
+    await saveSession(chatId, {
+      segment_index: session.segment_index + 1
+    });
+
+    setTimeout(() => sendNext(chatId), 500);
+
+  } catch (e) {
+    console.log(e.message);
+  } finally {
+    busy.delete(chatId);
+  }
 }
 
-async function resume(chatId) {
-  const s = await getSession(chatId);
-  if (s) await saveSession(chatId, { stopped: false });
-}
+// =================== TTS ===================
 
-async function elevenLabsTTS(text, signal) {
-  const safeText = String(text || "").slice(0, 2500);
-
+async function tts(text) {
   const res = await axios.post(
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
     {
-      text: safeText,
-      model_id: "eleven_multilingual_v2",
-      voice_settings: {
-        stability: 0.45,
-        similarity_boost: 0.85,
-        style: 0.30,
-        use_speaker_boost: true
-      }
+      text,
+      model_id: "eleven_multilingual_v2"
     },
     {
       headers: {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json",
-        Accept: "audio/mpeg"
+        "xi-api-key": ELEVENLABS_API_KEY
       },
-      responseType: "arraybuffer",
-      timeout: 60000,
-      signal
+      responseType: "arraybuffer"
     }
   );
 
   return Buffer.from(res.data);
+}
+
+// =================== HELPERS ===================
+
+async function stop(chatId) {
+  activeJobs[chatId] = 0;
+
+  const s = await getSession(chatId);
+  if (s) await saveSession(chatId, { stopped: true });
 }
 
 async function sendMessage(chatId, text) {
@@ -434,89 +217,76 @@ async function sendMessage(chatId, text) {
     chat_id: chatId,
     text,
     reply_markup: {
-      keyboard: [
-        ["▶️ Следующая глава"],
-        ["⏸ Пауза бота", "▶️ Продолжить"]
-      ],
+      keyboard: [["/next"], ["/stop"]],
       resize_keyboard: true
     }
   });
 }
 
-async function sendAudio(chatId, audioBuffer, filename, caption) {
+async function sendAudio(chatId, buffer, name, caption) {
   const form = new FormData();
-
   form.append("chat_id", chatId);
+  form.append("audio", buffer, { filename: name });
   form.append("caption", caption);
-  form.append("audio", audioBuffer, {
-    filename,
-    contentType: "audio/mpeg"
-  });
 
   await axios.post(`${TG}/sendAudio`, form, {
-    headers: form.getHeaders(),
-    maxContentLength: Infinity,
-    maxBodyLength: Infinity,
-    timeout: 120000
+    headers: form.getHeaders()
   });
 }
 
 async function getBookByKey(key) {
   const r = await pool.query("SELECT * FROM books WHERE key=$1", [key]);
   if (!r.rows.length) return null;
-
-  return {
-    key: r.rows[0].key,
-    title: r.rows[0].title,
-    parts: r.rows[0].parts
-  };
+  return r.rows[0];
 }
 
 async function getSession(chatId) {
   const r = await pool.query("SELECT * FROM sessions WHERE chat_id=$1", [chatId]);
-  return r.rows[0] || null;
+  return r.rows[0];
 }
 
 async function saveSession(chatId, data) {
-  const current = await getSession(chatId);
+  const cur = await getSession(chatId);
 
   const next = {
-    book_key: data.book_key ?? current?.book_key ?? null,
-    title: data.title ?? current?.title ?? null,
-    part_index: data.part_index ?? current?.part_index ?? 0,
-    stopped: data.stopped ?? current?.stopped ?? false
+    book_key: data.book_key ?? cur?.book_key,
+    part_index: data.part_index ?? cur?.part_index ?? 0,
+    segment_index: data.segment_index ?? cur?.segment_index ?? 0,
+    stopped: data.stopped ?? cur?.stopped ?? false
   };
 
   await pool.query(
-    `INSERT INTO sessions (chat_id, book_key, title, part_index, stopped, updated_at)
-     VALUES ($1,$2,$3,$4,$5,NOW())
+    `INSERT INTO sessions (chat_id, book_key, part_index, stopped)
+     VALUES ($1,$2,$3,$4)
      ON CONFLICT (chat_id)
-     DO UPDATE SET book_key=$2, title=$3, part_index=$4, stopped=$5, updated_at=NOW()`,
-    [chatId, next.book_key, next.title, next.part_index, next.stopped]
+     DO UPDATE SET book_key=$2, part_index=$3, stopped=$4`,
+    [chatId, next.book_key, next.part_index, next.stopped]
   );
 }
 
-async function getCachedAudio(bookKey, partIndex) {
-  const r = await pool.query(
-    "SELECT audio FROM audio_cache WHERE book_key=$1 AND part_index=$2",
-    [bookKey, partIndex]
-  );
+// =================== START ===================
 
-  return r.rows[0]?.audio || null;
+app.get("/", (req, res) => res.send("OK"));
+
+init();
+
+async function init() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS books (
+      key TEXT PRIMARY KEY,
+      title TEXT,
+      parts JSONB
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      chat_id TEXT PRIMARY KEY,
+      book_key TEXT,
+      part_index INT,
+      stopped BOOLEAN
+    )
+  `);
+
+  app.listen(PORT, () => console.log("V10 RUNNING"));
 }
-
-async function saveAudioCache(bookKey, partIndex, audio) {
-  await pool.query(
-    `INSERT INTO audio_cache (book_key, part_index, audio)
-     VALUES ($1,$2,$3)
-     ON CONFLICT (book_key, part_index) DO NOTHING`,
-    [bookKey, partIndex, audio]
-  );
-}
-
-initDB()
-  .then(() => app.listen(PORT, () => console.log(`SERVER RUNNING ON ${PORT} — V9`)))
-  .catch(err => {
-    console.log("DB INIT ERROR:", err.message);
-    process.exit(1);
-  });
